@@ -1,0 +1,5 @@
+node_modules/
+projects/
+client_secret*.json
+youtube_token.json
+cd
