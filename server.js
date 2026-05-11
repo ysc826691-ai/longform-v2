@@ -21,6 +21,9 @@ const YOUTUBE_REDIRECT = process.env.RAILWAY_PUBLIC_DOMAIN
   : 'http://localhost:5500/api/youtube/callback';
 
 function getOAuthClient() {
+  if (!fs.existsSync(CLIENT_SECRET_PATH)) {
+    throw new Error('client_secret.json 파일이 없습니다. YouTube 업로드를 사용하려면 Google Cloud Console에서 OAuth 클라이언트 인증 정보를 다운받아 client_secret.json 파일로 저장하세요.');
+  }
   const creds = JSON.parse(fs.readFileSync(CLIENT_SECRET_PATH, 'utf8'));
   const { client_id, client_secret } = creds.installed || creds.web;
   return new google.auth.OAuth2(client_id, client_secret, YOUTUBE_REDIRECT);
