@@ -687,20 +687,21 @@ STEP 3 (Punch): 마지막 대사 한 줄이 전체 영상의 가치를 결정한
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
 
     // 정보성 톤 여부 (프롬프트 조건 분기에 사용)
-    // 톤이 정보성이거나, 특별지침에 "실질적 정보 제공"을 요구하는 키워드가 있으면 정보성 모드로 전환
+    // ① 톤이 정보성 ② 특별지침에 정보 관련 키워드 ③ 주제 자체가 정보성 — 셋 중 하나라도 해당하면 정보성 모드
     const infoKeywordPattern = /신청(방법)?|연락처|인터넷\s*주소|홈페이지|url|구체적|실질적|지원금|복지|세금|보험|전화번호|기관/i;
+    const infoTopicPattern = /지원금|정부\s*지원|복지|세금|보험|연금|의료비?|취업\s*지원|채용|대출|금리|주거급여|장려금|바우처|수당|정책\s*안내|혜택\s*안내|신청\s*방법/;
     const isInfoScript = scriptTone === '정보 전달형 (명확하고 간결)' || scriptTone === '뉴스형 (객관적)' ||
-      (specialInstructions && infoKeywordPattern.test(specialInstructions));
+      (specialInstructions && infoKeywordPattern.test(specialInstructions)) ||
+      infoTopicPattern.test(topic);
 
     // 스토리텔링 대본 전용 서사 원칙 블록
     const narrativeBlock = !isInfoScript ? `
-【서사 원칙 — 최우선 적용, 아래 모든 규칙보다 우선함】
+【서사 원칙${specialInstructions ? ' — 단, 🔴 사용자 특별 지침이 존재하므로 충돌 시 특별 지침 우선' : ' — 최우선 적용, 아래 모든 규칙보다 우선함'}】
+- 소설·원작 기반 대본은 원작 줄거리와 장면을 정확히 따라가라. 임의로 내용을 만들거나 원작에 없는 해석·사건을 삽입하지 말 것. 원작의 사실이 이 대본의 유일한 근거다.
 - 너는 이야기를 처음 듣는 시청자에게 들려주는 낭독자다. 시청자가 원작을 전혀 모른다고 가정하고 인물·배경·상황을 자연스럽게 소개하며 이야기만 풀어라.
-- 원작 줄거리와 장면을 충실히 따라가라. 임의로 내용을 만들거나 원작에 없는 해석을 삽입하지 말 것.
 - 이야기를 처음부터 끝까지 끊기지 않는 하나의 흐름으로 이어라.
 - 챕터 번호(**1.** **2.** 등) 표시 절대 금지. 숫자 구분 없이 자연스럽게 이어질 것.
-- 현실 통계·정부 기관 정보·전화번호·홈페이지 삽입 절대 금지.
-- "우리 주변에서도", "실제로 많은 분들이", "현대 사회에서도" 등 현대 비교 표현 절대 금지.
+${specialInstructions ? '' : '- 현실 통계·정부 기관 정보·전화번호·홈페이지 삽입 절대 금지.\n'}- "우리 주변에서도", "실제로 많은 분들이", "현대 사회에서도" 등 현대 비교 표현 절대 금지.
 - "이 이야기는 우리에게 ~를 말합니다" 등 직접 교훈·설교 절대 금지. 메시지는 장면과 감정으로만 전달할 것.
 - "아직 제일 중요한 부분이 남았어요", "여기서 반전이 있습니다" 등 메타 표현 절대 금지.
 - 시청자에게 경험을 묻거나 댓글 유도 질문 삽입 절대 금지.
@@ -813,10 +814,10 @@ ${FORBIDDEN_KO}
       ? specialInstructions.trim()
       : '';
     const specialBlockKo = specialBlock
-      ? `\n🔴 사용자 특별 지침 (최우선 적용 — 아래 모든 규칙보다 우선):\n${specialBlock}\n`
+      ? `\n🔴 사용자 특별 지침 (절대 최우선 적용 — 서사 원칙·정확성 규칙 포함 아래의 모든 규칙보다 우선. 특별 지침과 다른 규칙이 충돌하면 반드시 특별 지침을 따를 것. 특별 지침의 모든 항목을 빠짐없이 검토하고 대본에 반영할 것):\n${specialBlock}\n`
       : '';
     const specialBlockEn = specialBlock
-      ? `\n🔴 USER SPECIAL INSTRUCTIONS (HIGHEST PRIORITY — override all rules below):\n${specialBlock}\n`
+      ? `\n🔴 USER SPECIAL INSTRUCTIONS (ABSOLUTE HIGHEST PRIORITY — override all rules below including narrative and accuracy rules. Review every item in the special instructions and reflect them fully in the script):\n${specialBlock}\n`
       : '';
 
     const scriptPrompt = isShorts ? shortsPrompt : scriptLang === 'en' ? `
