@@ -690,7 +690,7 @@ STEP 3 (Punch): 마지막 대사 한 줄이 전체 영상의 가치를 결정한
     // 톤이 정보성이거나, 특별지침에 "실질적 정보 제공"을 요구하는 키워드가 있으면 정보성 모드로 전환
     const infoKeywordPattern = /신청(방법)?|연락처|인터넷\s*주소|홈페이지|url|구체적|실질적|지원금|복지|세금|보험|전화번호|기관/i;
     const isInfoScript = scriptTone === '정보 전달형 (명확하고 간결)' || scriptTone === '뉴스형 (객관적)' ||
-      (specialBlock && infoKeywordPattern.test(specialBlock));
+      (specialInstructions && infoKeywordPattern.test(specialInstructions));
 
     // 스토리텔링 대본 전용 서사 원칙 블록
     const narrativeBlock = !isInfoScript ? `
