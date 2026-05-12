@@ -1020,6 +1020,12 @@ app.post('/api/scenes/generate', async (req, res) => {
   const script = fs.readFileSync(scriptPath, 'utf8');
   const meta   = JSON.parse(fs.readFileSync(pDir(projectId, 'meta.json'), 'utf8'));
 
+  // 정보성 콘텐츠 감지 (주제 또는 톤 기준)
+  const infoTopicRe = /지원금|정부\s*지원|복지|세금|보험|연금|의료비?|취업\s*지원|채용|대출|금리|주거급여|장려금|바우처|수당|정책|혜택\s*안내|신청\s*방법/;
+  const isInfoContent = infoTopicRe.test(meta.topic || '') ||
+    meta.scriptTone === '정보 전달형 (명확하고 간결)' ||
+    meta.scriptTone === '뉴스형 (객관적)';
+
   // 쇼츠 모드: 장면 수 최대 15로 제한 (길이별 유연하게)
   const isShorts = !!meta.isShorts;
   if (isShorts) sceneCount = Math.min(Number(sceneCount) || 5, 15);
@@ -1101,8 +1107,8 @@ ${tmpl}
 - RELATED_KO: 해당 SCRIPT_CHUNK의 핵심 대사 1문장을 한국어 원문 그대로 인용
 - RELATED_EN: RELATED_KO를 자연스러운 영어 구어체로 번역 (1문장)
 - SEARCH: SCRIPT_CHUNK에 등장하는 실제 인물/사물/장소/행동을 영어로 (스타일 단어 절대 금지)${visualCharDesc ? '. 인물이 등장하면 외모 키워드 반드시 포함' : ''}
-- PROMPT: SCRIPT_CHUNK 장면을 구체적으로 묘사하는 영어 이미지 프롬프트 (이미지 스타일 포함, 인물·행동·배경·감정·조명 포함)${visualCharDesc ? '. 인물은 반드시 등장인물 외모와 일치하게 묘사' : ''}
-- PROMPT 작성 시 절대 금지: 간판·현수막·포스터·문서·화면·인포그래픽·차트·숫자·전화번호·URL·기관명 등 텍스트가 포함될 수 있는 오브젝트 묘사 금지. 대신 인물·표정·행동·자연·배경·감정으로 시각화할 것
+- PROMPT: SCRIPT_CHUNK 장면을 구체적으로 묘사하는 영어 이미지 프롬프트 (이미지 스타일 포함, ${isInfoContent ? '내용·상황·환경 중심으로 시각화. 설명하는 사람 위주 금지 — 대신 그 정보가 실제로 적용되는 장면을 보여줄 것. 예) 소상공인 지원이면 활기찬 가게 내부, 취업지원이면 직업훈련 현장, 복지수당이면 가족이 안도하는 생활 공간, 정부지원이면 서류를 처리하는 손과 사무 환경' : '인물·행동·배경·감정·조명 포함'}${visualCharDesc ? '. 인물은 반드시 등장인물 외모와 일치하게 묘사' : ''})
+- PROMPT 작성 시 절대 금지: 간판·현수막·포스터·문서·화면·인포그래픽·차트·숫자·전화번호·URL·기관명 등 텍스트가 포함될 수 있는 오브젝트 묘사 금지. ${isInfoContent ? '대신 상황·공간·사람들의 표정·행동으로 정보의 실질적 의미를 시각화할 것' : '대신 인물·표정·행동·자연·배경·감정으로 시각화할 것'}
 - 반드시 ${sceneCount}개 [SCENE]...[/SCENE] 블록을 모두 완성하라. 절대 생략하지 마라.
 
 ${FORBIDDEN_EN}`;
@@ -1173,7 +1179,8 @@ ${FORBIDDEN_EN}`;
           prompt: buildPrompt(makeBatchTemplate(batch), prevScenePrompt, firstScenePrompt),
           maxTokens: 8192,
           temp: 0.7,
-          model: 'gemini-2.5-flash'
+          model: 'gemini-2.5-flash',
+          thinkingBudget: 0
         });
         const parsed = parseScenes(raw);
         console.log(`[SCENES] 배치 결과: ${parsed.length}/${batch.length}`);
@@ -1208,7 +1215,8 @@ ${FORBIDDEN_EN}`;
             prompt: buildPrompt(makeBatchTemplate(batch)),
             maxTokens: 8192,
             temp: 0.5,
-            model: 'gemini-2.5-flash'
+            model: 'gemini-2.5-flash',
+            thinkingBudget: 0
           });
           scenes.push(...parseScenes(raw2));
         } catch (e) {
