@@ -2933,12 +2933,12 @@ Return ONLY a JSON array, no markdown:
 ko: Korean version (same visual meaning, max 200 chars)`;
 
   try {
-    const raw = await geminiText({ apiKey: geminiKey, prompt: `${sysPrompt}\n\nSCENES:\n${sceneList}`, temp: 0.7, model: 'gemini-2.5-flash' });
-    const clean = raw.trim().replace(/^```json\s*/, '').replace(/^```\s*/, '').replace(/\s*```$/, '');
+    const raw = await geminiText({ apiKey: geminiKey, prompt: `${sysPrompt}\n\nSCENES:\n${sceneList}`, temp: 0.7, model: 'gemini-2.5-flash', thinkingBudget: 0 });
+    const clean = raw.trim().replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '');
     let parsed;
     try { parsed = JSON.parse(clean); } catch {
-      const m = clean.match(/\[[\s\S]*\]/);
-      if (!m) throw new Error('Flow 비디오 프롬프트 JSON 파싱 실패');
+      const m = clean.match(/\[[\s\S]*?\]/s);
+      if (!m) throw new Error(`Flow 텍스트→비디오 JSON 파싱 실패 (raw: ${raw.slice(0, 200)})`);
       parsed = JSON.parse(m[0]);
     }
 
@@ -3010,12 +3010,12 @@ Return ONLY a JSON array, no markdown:
 ko: Korean version (same meaning, max 200 chars)`;
 
   try {
-    const raw = await geminiText({ apiKey: geminiKey, prompt: `${sysPrompt}\n\nSCENES:\n${sceneList}`, temp: 0.7, model: 'gemini-2.5-flash' });
-    const clean = raw.trim().replace(/^```json\s*/, '').replace(/^```\s*/, '').replace(/\s*```$/, '');
+    const raw = await geminiText({ apiKey: geminiKey, prompt: `${sysPrompt}\n\nSCENES:\n${sceneList}`, temp: 0.7, model: 'gemini-2.5-flash', thinkingBudget: 0 });
+    const clean = raw.trim().replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '');
     let parsed;
     try { parsed = JSON.parse(clean); } catch {
-      const m = clean.match(/\[[\s\S]*\]/);
-      if (!m) throw new Error('Flow 에셋 비디오 프롬프트 JSON 파싱 실패');
+      const m = clean.match(/\[[\s\S]*?\]/s);
+      if (!m) throw new Error(`Flow 에셋→비디오 JSON 파싱 실패 (raw: ${raw.slice(0, 200)})`);
       parsed = JSON.parse(m[0]);
     }
 
