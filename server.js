@@ -1008,7 +1008,7 @@ app.post('/api/script/save', async (req, res) => {
 // 장면 생성
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/scenes/generate', async (req, res) => {
-  const { projectId, imageStyle = 'Cinematic realistic photography', characterDesc = '' } = req.body;
+  const { projectId, imageStyle = 'Cinematic realistic photography', characterDesc = '', characterEthnicity = '' } = req.body;
   let { sceneCount = 15 } = req.body;
   const geminiKey = resolveKey(req.body.geminiKey);
   if (!geminiKey) return res.status(400).json({ error: 'Gemini API Key 필요' });
@@ -1121,7 +1121,7 @@ ${FORBIDDEN_EN}`;
     batchChunks.map(({ idx, chunk }) => `
 [SCENE]
 NUMBER: ${idx}
-SCRIPT_CHUNK: ${chunk.slice(0, 350)}
+SCRIPT_CHUNK: ${chunk.slice(0, 700)}
 TITLE: (장면 제목)
 RELATED_KO: (위 SCRIPT_CHUNK 핵심 대사 1문장 한국어 원문)
 RELATED_EN: (English translation, natural spoken)
@@ -1148,7 +1148,7 @@ ${tmpl}
 - RELATED_KO: SCRIPT_CHUNK에서 핵심 대사 1문장 한국어 원문 그대로
 - RELATED_EN: 위를 자연스러운 영어 구어체로 번역
 - SEARCH: 실제 등장 인물/사물/장소/행동 영어 키워드${visualCharDesc ? ', 인물 외모 키워드 포함' : ''}
-- PROMPT: ⭐ 반드시 이 씬의 SCRIPT_CHUNK에서 묘사하는 실제 장면·행동·인물·배경만 시각화하라. 이 씬 번호의 SCRIPT_CHUNK와 무관한 이미지 절대 금지. 영어 이미지 프롬프트 (인물·행동·배경·조명 순서로 구체적으로)${visualCharDesc ? ', 인물 외모 일치 필수' : ''}. 28번 씬이면 28번 SCRIPT_CHUNK만, 30번 씬이면 30번 SCRIPT_CHUNK만 시각화할 것 — 앞 씬 내용 반복 금지. ⚠ PROMPT에 절대 포함 금지: 따옴표 안 문장, 대사 인용, | 기호 이후 텍스트, text, letters, words, subtitles, captions, watermark, sign, banner, typography, writing, quote — 이미지 안에 어떤 글자도 없어야 함. PROMPT는 순수 시각 묘사만.
+- PROMPT: ⭐ 반드시 이 씬의 SCRIPT_CHUNK 핵심 포인트를 시각화하라. SCRIPT_CHUNK와 무관한 이미지 절대 금지.${isInfoContent ? ` 【정보성 콘텐츠 필수 규칙】이 씬이 전달하는 핵심 정보(지원제도·혜택·상황)가 실제로 펼쳐지는 생생한 장면을 보여줄 것. 설명자(나레이터) 단독 등장 금지 — 반드시 그 정보가 실제 삶에 적용되는 장면과 함께 묘사. 예시: 주거지원→가족이 밝은 새집에 짐 푸는 장면, 학자금대출→도서관서 집중하는 대학생, 소상공인바우처→활기찬 가게 안 사장님 표정, K-패스→대중교통 타며 카드 찍는 손, 취업지원→악수하는 청년과 면접관, 긴급복지→안도하는 가족의 식탁. 영어 이미지 프롬프트 (장면·공간·인물행동·표정·조명 순서로 구체적으로)` : ` 영어 이미지 프롬프트 (인물·행동·배경·조명 순서로 구체적으로)`}${visualCharDesc ? ', 인물 외모 일치 필수' : ''}. ⚠ PROMPT에 절대 포함 금지: 따옴표 안 문장, 대사 인용, | 기호 이후 텍스트, text, letters, words, subtitles, captions, watermark, sign, banner, typography, writing, quote — 이미지 안에 어떤 글자도 없어야 함. PROMPT는 순수 시각 묘사만.
 - PROMPT_KO: 위 PROMPT가 담은 장면 내용을 한국어로 1~2문장 설명 (이미지 프롬프트 해석)
 - CHUNK_EN: SCRIPT_CHUNK 전체를 자연스러운 영어로 번역 (원문 길이 그대로, 요약 금지)
 - [SCENE]과 [/SCENE] 태그는 반드시 유지
@@ -1237,7 +1237,7 @@ ${FORBIDDEN_EN}`;
     let charTags = '';
     if (visualCharDesc && visualCharDesc.trim()) {
       // 영어 시각 키워드만 추출 (3글자 이상, 불용어 제외)
-      const stopWords = new Set(['with','from','that','this','their','have','into','also','each','very','such','long','dark','pale','light']);
+      const stopWords = new Set(['with','from','that','this','their','have','into','also','each','very','such','long','dark','pale','light','all','characters','must','appearance','features','facial','asian','korean','western','european','caucasian','hispanic','latino','african','middle','eastern','arabic','south']);
       const words = visualCharDesc
         .replace(/[^a-zA-Z\s]/g, ' ')
         .split(/\s+/)
@@ -1260,7 +1260,45 @@ ${FORBIDDEN_EN}`;
     meta.status = 'scenes_done';
     fs.writeFileSync(pDir(projectId, 'meta.json'), JSON.stringify(meta, null, 2));
 
-    res.json({ scenes, requested: sceneCount, generated: scenes.length, visualCharDesc, charTags });
+    const ethnicityLabels = {
+      'all characters must be East Asian Korean appearance with Asian facial features': '동양인 (한국/동아시아)',
+      'all characters must be Western European Caucasian appearance with European facial features': '서양인 (유럽/서양)',
+      'all characters must be Hispanic or Latino appearance with Latin American facial features': '라틴/히스패닉',
+      'all characters must be South Asian Indian appearance with South Asian facial features': '남아시아 (인도/남아시아)',
+      'all characters must be African Black appearance with African facial features': '아프리카인',
+      'all characters must be Middle Eastern Arabic appearance with Middle Eastern facial features': '중동/아랍',
+    };
+    const ethnicLabel = ethnicityLabels[characterEthnicity] || (characterEthnicity ? '직접 지정' : '동양인 자동 적용 (한국어 대본 기준)');
+    let charOnly = characterDesc;
+    for (const ev of Object.keys(ethnicityLabels)) charOnly = charOnly.split(ev).join('');
+    charOnly = charOnly.replace(/^\.\s*/, '').replace(/\.\s*$/, '').trim();
+
+    const appliedGuidelines = [
+      // 인물 인종
+      { icon: '👤', label: '인물 인종',
+        value: charOnly
+          ? `${ethnicLabel} — 모든 장면 인물에 일관 적용 / 인물 설명: ${charOnly.length > 50 ? charOnly.slice(0,50)+'…' : charOnly}`
+          : `${ethnicLabel} — 모든 장면 인물에 일관 적용` },
+      // 이미지 스타일 (사용자 선택값 그대로)
+      { icon: '🎨', label: '이미지 스타일', value: imageStyle.split(',')[0].trim() },
+      // 이미지 생성 규칙
+      isInfoContent
+        ? { icon: '📋', label: '이미지 생성 규칙',
+            value: '정보성 콘텐츠 — 설명자 단독 등장 금지. 대본의 핵심 내용(지원제도·기관·혜택)이 실제 삶에 적용되는 장면으로 시각화. 유관기관 언급 시 해당 상황·환경 표출.' }
+        : { icon: '🎭', label: '이미지 생성 규칙',
+            value: '일반/이야기 콘텐츠 — 대본 장면의 인물·행동·감정·배경 충실히 시각화. 원작 소설·이야기 기반 시 원작 묘사에 최대한 가깝게 생성.' },
+      // 쇼츠 모드
+      isShorts
+        ? { icon: '📱', label: '쇼츠 모드', value: `세로(9:16) 구도, 클로즈업·중앙 구성 적용, 최대 ${sceneCount}장면` }
+        : null,
+      // 사용자 특별지침
+      meta.specialInstructions
+        ? { icon: '⭐', label: '사용자 특별지침',
+            value: meta.specialInstructions.length > 80 ? meta.specialInstructions.slice(0,80)+'…' : meta.specialInstructions }
+        : null,
+    ].filter(Boolean);
+
+    res.json({ scenes, requested: sceneCount, generated: scenes.length, visualCharDesc, charTags, appliedGuidelines });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

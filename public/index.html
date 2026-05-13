@@ -740,6 +740,15 @@ video{width:100%;border-radius:9px;background:#000;max-height:480px;
 
   <div id="sceneResult" style="display:none;margin-top:16px">
 
+    <!-- 참고 지침 박스 -->
+    <div id="guidelineBox" style="display:none;margin-bottom:16px;padding:14px 18px;background:rgba(1,179,255,.05);border:1px solid rgba(1,179,255,.25);border-radius:12px">
+      <div style="font-size:13px;font-weight:800;color:var(--accent);margin-bottom:10px;display:flex;align-items:center;gap:6px">
+        🔍 이번 장면 생성에 적용된 지침
+        <span style="font-size:11px;font-weight:400;color:var(--dim)">(AI가 장면을 만들 때 참고한 규칙)</span>
+      </div>
+      <div id="guidelineList" style="display:flex;flex-direction:column;gap:7px"></div>
+    </div>
+
     <!-- ① 언어 보기 토글 (가장 상단, 눈에 잘 띄게) -->
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;padding:12px 16px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;flex-wrap:wrap">
       <span style="font-size:13px;font-weight:700;color:var(--text);white-space:nowrap">씬 내용 보기</span>
@@ -3299,7 +3308,8 @@ async function generateScenes() {
         geminiKey,
         sceneCount: Number(document.getElementById('sceneCount').value),
         imageStyle: document.getElementById('imageStyle').value,
-        characterDesc: buildFullCharDesc()
+        characterDesc: buildFullCharDesc(),
+        characterEthnicity: document.getElementById('characterEthnicity')?.value || ''
       })
     });
     const d = await r.json();
@@ -3308,6 +3318,7 @@ async function generateScenes() {
     scenesData = d.scenes;
     // charTags를 각 씬에 주입 (영상 검색 모달에서 표시용)
     if (d.charTags) scenesData.forEach(sc => sc._charTags = d.charTags);
+    renderGuidelineBox(d.appliedGuidelines);
     renderScenes(d.scenes);
     document.getElementById('exportUploadCard').style.display = 'block';
     const charMsg = d.charTags ? ` | 인물 태그: "${d.charTags}"` : '';
@@ -3317,6 +3328,21 @@ async function generateScenes() {
     showSt2('st03','err','오류: ' + e.message);
   }
   btn.disabled = false;
+}
+
+function renderGuidelineBox(guidelines) {
+  const box  = document.getElementById('guidelineBox');
+  const list = document.getElementById('guidelineList');
+  if (!box || !list) return;
+  if (!guidelines || !guidelines.length) { box.style.display = 'none'; return; }
+  list.innerHTML = guidelines.map(g =>
+    `<div style="display:flex;align-items:flex-start;gap:8px;font-size:13px;line-height:1.5">
+      <span style="font-size:15px;flex-shrink:0">${g.icon}</span>
+      <div><span style="font-weight:700;color:var(--fg)">${g.label}:</span>
+      <span style="color:var(--dim)">${g.value}</span></div>
+    </div>`
+  ).join('');
+  box.style.display = 'block';
 }
 
 function renderScenes(scenes) {
