@@ -12,6 +12,25 @@ const { google } = require('googleapis');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
+// ── 정보성 콘텐츠: 씬별 핵심 기관 정보 추출 ────────────────────────────────────
+function extractInfoOverlay(text) {
+  // 전화번호: "전화번호 1357", "전화번호 1600-5500" 패턴
+  const phoneMatch = text.match(/전화번호\s*([\d][\d\-]+[\d])/);
+  // URL: semas.or.kr, moel.go.kr 등
+  const urlMatch   = text.match(/([\w\-]+\.(?:go|or|com|kr|net)(?:\/[\w./]*)?)/i);
+  // 기관명
+  const agencyRe   = /(소상공인시장진흥공단|고용노동부|중소벤처기업부|국세청|서민금융진흥원|신용회복위원회)/;
+  const agencyMatch = text.match(agencyRe);
+
+  if (!phoneMatch && !urlMatch) return null;
+
+  const parts = [];
+  if (agencyMatch) parts.push(agencyMatch[1]);
+  if (phoneMatch)  parts.push(`☎ ${phoneMatch[1]}`);
+  if (urlMatch)    parts.push(urlMatch[1]);
+  return parts.join('  |  ');
+}
+
 // ── YouTube OAuth 설정 ────────────────────────────────────────────────────────
 const CLIENT_SECRET_PATH = path.join(__dirname, 'client_secret.json');
 const TOKEN_PATH         = path.join(__dirname, 'youtube_token.json');
@@ -1009,7 +1028,7 @@ app.post('/api/script/save', async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/scenes/generate', async (req, res) => {
   const { projectId, imageStyle = 'Cinematic realistic photography', characterDesc = '', characterEthnicity = '' } = req.body;
-  let { sceneCount = 15 } = req.body;
+  let sceneCount = Number(req.body.sceneCount) || 15;
   const geminiKey = resolveKey(req.body.geminiKey);
   if (!geminiKey) return res.status(400).json({ error: 'Gemini API Key 필요' });
   if (!projectId) return res.status(400).json({ error: 'projectId 필요' });
@@ -1032,10 +1051,33 @@ app.post('/api/scenes/generate', async (req, res) => {
 
   // 대본을 sceneCount 등분 → 각 장면이 대본의 특정 구간을 직접 담당
   const scriptNorm = script.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
-  const chunkSize  = Math.ceil(scriptNorm.length / sceneCount);
-  const chunks     = Array.from({ length: sceneCount }, (_, i) =>
-    scriptNorm.slice(i * chunkSize, (i + 1) * chunkSize).trim()
-  );
+
+  // 단락 경계를 존중하는 스마트 분할 (정보성/일반 공통)
+  function splitAtParagraphs(text, count) {
+    const chunkSize = Math.ceil(text.length / count);
+    const result = [];
+    let pos = 0;
+    for (let i = 0; i < count; i++) {
+      if (i === count - 1) { result.push(text.slice(pos).trim()); break; }
+      const ideal = pos + chunkSize;
+      const win = Math.floor(chunkSize * 0.35);
+      const searchStart = Math.max(pos + 1, ideal - win);
+      const searchEnd   = Math.min(text.length - 1, ideal + win);
+      const sub = text.slice(searchStart, searchEnd);
+      const paraBreak = sub.lastIndexOf('\n\n');
+      if (paraBreak >= 0) {
+        const bp = searchStart + paraBreak + 2;
+        result.push(text.slice(pos, bp).trim());
+        pos = bp;
+      } else {
+        result.push(text.slice(pos, ideal).trim());
+        pos = ideal;
+      }
+    }
+    return result;
+  }
+
+  const chunks = splitAtParagraphs(scriptNorm, sceneCount);
 
   const template = chunks.map((chunk, i) => `
 [SCENE]
@@ -1116,12 +1158,18 @@ ${FORBIDDEN_EN}`;
   // 배치 크기: 한 번에 최대 8장면 (포맷 유지 안정성)
   const BATCH = 5; // 5장씩 배치 (8→5로 줄여 누락 방지)
 
+  // 정보성 콘텐츠 사전 분석 결과 (pre-analysis pass에서 채워짐)
+  let sceneVisualHints = [];
+
   const shortsStyleHint = isShorts ? ', vertical portrait 9:16 framing, centered subject, close-up or medium shot, bold composition' : '';
   const makeBatchTemplate = (batchChunks) =>
-    batchChunks.map(({ idx, chunk }) => `
+    batchChunks.map(({ idx, chunk }) => {
+      const hint = isInfoContent ? sceneVisualHints.find(h => Number(h.num) === idx) : null;
+      const hintLine = hint ? `\nVISUAL_HINT: ${hint.visual}` : '';
+      return `
 [SCENE]
 NUMBER: ${idx}
-SCRIPT_CHUNK: ${chunk.slice(0, 700)}
+SCRIPT_CHUNK: ${chunk.slice(0, 700)}${hintLine}
 TITLE: (장면 제목)
 RELATED_KO: (위 SCRIPT_CHUNK 핵심 대사 1문장 한국어 원문)
 RELATED_EN: (English translation, natural spoken)
@@ -1130,13 +1178,35 @@ SEARCH: (3-5 English keywords, NO style words)
 PROMPT: (image prompt in English, include style: ${imageStyle}${shortsStyleHint})
 PROMPT_KO: (위 PROMPT가 담은 장면 내용을 한국어로 1~2문장 설명)
 CHUNK_EN: (SCRIPT_CHUNK 전체를 자연스러운 영어로 번역, 원문 길이 유지)
-[/SCENE]`).join('\n');
+[/SCENE]`;
+    }).join('\n');
 
-  const buildPrompt = (tmpl, prevScenePrompt = '', firstScenePrompt = '') =>
-`주제: ${meta.topic}
+  const buildPrompt = (tmpl, prevScenePrompt = '', firstScenePrompt = '', batchStart = 1, batchEnd = sceneCount) => {
+  // 소설/드라마 전용: 스토리 컨텍스트 블록 생성
+  let storyCtxBlock = '';
+  if (!isInfoContent && storyContext) {
+    const parts = [];
+    if (storyContext.characters?.length > 0) {
+      const charLines = storyContext.characters.map(c => {
+        const costume = [...(c.costume_changes || [])].reverse().find(ch => ch.from_scene <= batchStart);
+        const appearance = costume ? `${c.appearance} / 현재 의상: ${costume.desc}` : c.appearance;
+        return `  ${c.name}: ${appearance}`;
+      }).join('\n');
+      parts.push(`👤 등장인물 외모 (씬 ${batchStart} 기준):\n${charLines}`);
+    }
+    const loc = storyContext.locations?.find(l => l.scene_range[0] <= batchStart && l.scene_range[1] >= batchStart);
+    if (loc) parts.push(`📍 현재 장소: ${loc.name} — ${loc.visual}`);
+    const emo = storyContext.emotional_arc?.find(e => e.scene_range[0] <= batchStart && e.scene_range[1] >= batchStart);
+    if (emo) parts.push(`💭 감정 흐름: ${emo.state} (${emo.note})`);
+    const beats = (storyContext.story_beats || []).filter(b => b.scene >= batchStart && b.scene <= batchEnd);
+    if (beats.length > 0) parts.push(`⚡ 이 구간 전환점: ${beats.map(b => `씬${b.scene} — ${b.event}`).join(' / ')}`);
+    if (storyContext.continuity_rules?.length > 0) parts.push(`🔒 연속성 규칙: ${storyContext.continuity_rules.join(' / ')}`);
+    if (parts.length > 0) storyCtxBlock = `\n📖 스토리 컨텍스트 (씬 ${batchStart}~${batchEnd}):\n${parts.join('\n')}\n`;
+  }
+  return `주제: ${meta.topic}
 이미지 스타일: ${imageStyle}
 ${visualCharDesc ? `등장인물 외모 (일관성 필수): ${visualCharDesc}` : ''}
-${physicalRules ? `\n${physicalRules}\n` : ''}${firstScenePrompt ? `🎬 1번 씬 PROMPT (전체 기준점 — 끝까지 인물·배경 일관성 유지): ${firstScenePrompt}` : ''}
+${physicalRules ? `\n${physicalRules}\n` : ''}${storyCtxBlock}${firstScenePrompt ? `🎬 1번 씬 PROMPT (전체 기준점 — 끝까지 인물·배경 일관성 유지): ${firstScenePrompt}` : ''}
 ${prevScenePrompt ? `⬆ 바로 이전 씬 PROMPT (직전 연속성 참고): ${prevScenePrompt}` : ''}
 
 아래 각 [SCENE] 블록의 SCRIPT_CHUNK를 읽고 빈 칸을 채워라.
@@ -1148,22 +1218,122 @@ ${tmpl}
 - RELATED_KO: SCRIPT_CHUNK에서 핵심 대사 1문장 한국어 원문 그대로
 - RELATED_EN: 위를 자연스러운 영어 구어체로 번역
 - SEARCH: 실제 등장 인물/사물/장소/행동 영어 키워드${visualCharDesc ? ', 인물 외모 키워드 포함' : ''}
-- PROMPT: ⭐ 반드시 이 씬의 SCRIPT_CHUNK 핵심 포인트를 시각화하라. SCRIPT_CHUNK와 무관한 이미지 절대 금지.${isInfoContent ? ` 【정보성 콘텐츠 필수 규칙】이 씬이 전달하는 핵심 정보(지원제도·혜택·상황)가 실제로 펼쳐지는 생생한 장면을 보여줄 것. 설명자(나레이터) 단독 등장 금지 — 반드시 그 정보가 실제 삶에 적용되는 장면과 함께 묘사. 예시: 주거지원→가족이 밝은 새집에 짐 푸는 장면, 학자금대출→도서관서 집중하는 대학생, 소상공인바우처→활기찬 가게 안 사장님 표정, K-패스→대중교통 타며 카드 찍는 손, 취업지원→악수하는 청년과 면접관, 긴급복지→안도하는 가족의 식탁. 영어 이미지 프롬프트 (장면·공간·인물행동·표정·조명 순서로 구체적으로)` : ` 영어 이미지 프롬프트 (인물·행동·배경·조명 순서로 구체적으로)`}${visualCharDesc ? ', 인물 외모 일치 필수' : ''}. ⚠ PROMPT에 절대 포함 금지: 따옴표 안 문장, 대사 인용, | 기호 이후 텍스트, text, letters, words, subtitles, captions, watermark, sign, banner, typography, writing, quote — 이미지 안에 어떤 글자도 없어야 함. PROMPT는 순수 시각 묘사만.
+- PROMPT: ⭐ 반드시 이 씬의 SCRIPT_CHUNK 핵심 포인트를 시각화하라. SCRIPT_CHUNK와 무관한 이미지 절대 금지.${isInfoContent ? ` 【정보성 콘텐츠 필수 규칙】VISUAL_HINT가 있으면 그 방향을 최우선으로 활용해 PROMPT를 구성하라. 이 씬이 전달하는 핵심 정보(지원제도·혜택·상황)가 실제로 펼쳐지는 생생한 장면을 보여줄 것. 설명자(나레이터) 단독 등장 금지 — 반드시 그 정보가 실제 삶에 적용되는 장면과 함께 묘사. 예시: 주거지원→가족이 밝은 새집에 짐 푸는 장면, 학자금대출→도서관서 집중하는 대학생, 소상공인바우처→활기찬 가게 안 사장님 표정, K-패스→대중교통 타며 카드 찍는 손, 취업지원→악수하는 청년과 면접관, 긴급복지→안도하는 가족의 식탁. 영어 이미지 프롬프트 (장면·공간·인물행동·표정·조명 순서로 구체적으로)` : ` 영어 이미지 프롬프트 (인물·행동·배경·조명 순서로 구체적으로)`}${visualCharDesc ? ', 인물 외모 일치 필수' : ''}. ⚠ PROMPT에 절대 포함 금지: 따옴표 안 문장, 대사 인용, | 기호 이후 텍스트, text, letters, words, subtitles, captions, watermark, sign, banner, typography, writing, quote — 이미지 안에 어떤 글자도 없어야 함. PROMPT는 순수 시각 묘사만.
 - PROMPT_KO: 위 PROMPT가 담은 장면 내용을 한국어로 1~2문장 설명 (이미지 프롬프트 해석)
 - CHUNK_EN: SCRIPT_CHUNK 전체를 자연스러운 영어로 번역 (원문 길이 그대로, 요약 금지)
 - [SCENE]과 [/SCENE] 태그는 반드시 유지
-
-【씬 연속성 규칙 — 필수】
+${isInfoContent ? `
+【시각 다양성 필수 — 정보성 콘텐츠】
+- 이 배치 내 모든 장면 PROMPT가 서로 다른 공간·상황·인물 조합을 사용해야 함
+- 연속 2개 이상 같은 배경(노트북 책상, 사무실 환경 등)으로 PROMPT 작성 절대 금지
+- 각 장면마다 새로운 장소(가게 내부, 현장 사무실, 주거공간, 교통수단, 창고, 훈련센터 등)를 다양하게 활용할 것
+` : ''}
+${isInfoContent ? `【씬 독립성 규칙 — 정보성 콘텐츠 필수】
+- 각 씬은 담당하는 정보·정책 주제에 맞는 독립적인 장면으로 구성할 것
+- 이전 씬 배경과 달라도 됨 — 오히려 다른 장소·상황이 권장됨
+- VISUAL_HINT가 있는 씬은 반드시 그 힌트 방향을 PROMPT의 핵심 장면으로 사용할 것
+- 동일한 설정(책상, 사무실, 노트북 등)이 배치 내에서 2회 이상 등장하면 규칙 위반` : `【씬 연속성 규칙 — 필수】
 - 같은 씬 내: 인물 외모·복장·배경이 처음부터 끝까지 일관되게 유지
 - 연속된 씬 사이: 앞 씬 끝부분의 인물·장소·분위기가 다음 씬 시작과 자연스럽게 이어져야 함
 - 장소·배경이 바뀔 경우에도 인물 외모(복장 등)는 동일하게 유지
 - 급격한 배경·인물 단절 금지 — 시청자가 같은 이야기를 보고 있다는 느낌이 유지되어야 함
 ${firstScenePrompt ? `- 1번 씬 PROMPT를 전체 기준으로 삼아 인물·배경의 세계관을 끝까지 일관되게 유지할 것` : ''}
-${prevScenePrompt ? `- 이전 씬 PROMPT를 참고해 이 배치 첫 번째 씬의 인물·배경을 자연스럽게 연결할 것` : ''}
+${prevScenePrompt ? `- 이전 씬 PROMPT를 참고해 이 배치 첫 번째 씬의 인물·배경을 자연스럽게 연결할 것` : ''}`}
 
 ${FORBIDDEN_EN}`;
+  };
 
   try {
+    // ── 소설/드라마: 스토리 컨텍스트 사전 분석 ────────────────────────────────
+    let storyContext = null;
+    if (!isInfoContent) {
+      const storyCtxPath = pDir(projectId, 'story_context.json');
+      if (fs.existsSync(storyCtxPath)) {
+        try {
+          storyContext = JSON.parse(fs.readFileSync(storyCtxPath, 'utf8'));
+          console.log('[SCENES] 스토리 컨텍스트 캐시 사용');
+        } catch (e) { storyContext = null; }
+      }
+      if (!storyContext) {
+        console.log('[SCENES] 소설/드라마 — 대본 전체 분석 중...');
+        try {
+          const analysisPrompt = `다음은 YouTube 영상 대본입니다. 이미지 생성 AI가 각 장면을 일관성 있게 시각화할 수 있도록 대본을 분석해 주세요.
+
+대본 (총 ${sceneCount}개 장면으로 나뉠 예정):
+${scriptNorm.slice(0, 8000)}${scriptNorm.length > 8000 ? '\n...(이후 생략)' : ''}
+
+아래 JSON 형식으로만 반환하세요 (다른 설명 없음):
+{
+  "characters": [
+    {"name":"인물이름","appearance":"나이대·체형·헤어·의상 기본 스타일 (시각적 특징만, 영어 아닌 한국어)","costume_changes":[{"from_scene":1,"desc":"이 씬부터 적용되는 의상"}]}
+  ],
+  "locations": [
+    {"name":"장소명","visual":"시각적 특징 (조명·분위기·주요 오브젝트)","scene_range":[시작씬번호,끝씬번호]}
+  ],
+  "emotional_arc": [
+    {"scene_range":[시작씬,끝씬],"state":"감정 한 단어","note":"간단한 상황 설명"}
+  ],
+  "continuity_rules": ["씬 전반에 유지해야 할 시각적 규칙. 예: 주인공은 항상 낡은 가방 소지"],
+  "story_beats": [{"scene":씬번호,"event":"이 씬의 주요 전환점 (장소·의상·감정 변화 포함)"}]
+}
+
+주의: 시각화에 필요한 정보만 추출. 장면 번호는 1~${sceneCount}. JSON만 출력.`;
+          const analysisRaw = await geminiText({
+            apiKey: geminiKey,
+            prompt: analysisPrompt,
+            maxTokens: 3000,
+            temp: 0.2,
+            model: 'gemini-2.5-flash',
+            thinkingBudget: 0
+          });
+          const jsonMatch = analysisRaw.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            storyContext = JSON.parse(jsonMatch[0]);
+            fs.writeFileSync(storyCtxPath, JSON.stringify(storyContext, null, 2), 'utf8');
+            console.log(`[SCENES] 스토리 분석 완료 — 인물 ${storyContext.characters?.length || 0}명, 장소 ${storyContext.locations?.length || 0}개`);
+          }
+        } catch (e) {
+          console.log('[SCENES] 스토리 분석 실패 (스킵):', e.message);
+        }
+      }
+    }
+
+    // ── 정보성 콘텐츠: 사전 분석 패스 (NotebookLM 방식) ──────────────────────
+    if (isInfoContent) {
+      console.log('[SCENES] 정보성 콘텐츠 — 장면별 시각 힌트 사전 분석 중...');
+      try {
+        const preAnalysisPrompt = `다음은 정보성 YouTube 대본입니다. 이 대본을 ${sceneCount}개 장면으로 나눌 때, 각 장면에 가장 적합한 시각화 방향을 분석해 주세요.
+
+대본:
+${scriptNorm.slice(0, 6000)}${scriptNorm.length > 6000 ? '\n...(이후 생략)' : ''}
+
+각 장면 번호(1~${sceneCount})에 대해 아래 JSON 배열 형식으로만 반환하세요:
+[{"num":1,"topic":"이 구간의 핵심 주제 (한 문장)","visual":"이 정보가 실제 삶에 적용되는 생생한 장면 묘사 (공간+사람+행동, 한국어 1~2문장, 구체적으로)"}]
+
+규칙:
+- 각 장면의 visual이 서로 달라야 함 (반복 금지)
+- visual은 반드시 그 정보가 실제로 쓰이는 현장 (설명자/나레이터 단독 금지)
+- 예: 소상공인 지원→활기찬 가게 안 사장님이 서류 확인, 취업지원→청년이 훈련센터에서 교육 수료, K-패스→직장인이 버스 탑승 시 카드 태그, 학자금→도서관서 집중하는 대학생
+- JSON만 출력, 다른 설명 없음`;
+
+        const hintRaw = await geminiText({
+          apiKey: geminiKey,
+          prompt: preAnalysisPrompt,
+          maxTokens: 3000,
+          temp: 0.3,
+          model: 'gemini-2.5-flash',
+          thinkingBudget: 0
+        });
+        const jsonMatch = hintRaw.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          sceneVisualHints = JSON.parse(jsonMatch[0]);
+          console.log(`[SCENES] 시각 힌트 분석 완료: ${sceneVisualHints.length}개 장면`);
+        }
+      } catch (e) {
+        console.log('[SCENES] 시각 힌트 분석 실패 (스킵):', e.message);
+      }
+    }
+
     // ── 배치 단위로 장면 생성 ────────────────────────────────────────────────
     const allChunks = chunks.map((chunk, i) => ({ idx: i + 1, chunk }));
     let scenes = [];
@@ -1174,9 +1344,10 @@ ${FORBIDDEN_EN}`;
       const batch = allChunks.slice(b, b + BATCH);
       console.log(`[SCENES] 배치 ${Math.floor(b/BATCH)+1} — 장면 ${batch[0].idx}~${batch[batch.length-1].idx}`);
       try {
+        // 정보성 콘텐츠는 진행자 책상 장면(1번)을 전체 기준점으로 강제하지 않음
         const raw = await geminiText({
           apiKey: geminiKey,
-          prompt: buildPrompt(makeBatchTemplate(batch), prevScenePrompt, firstScenePrompt),
+          prompt: buildPrompt(makeBatchTemplate(batch), prevScenePrompt, isInfoContent ? '' : firstScenePrompt, batch[0].idx, batch[batch.length - 1].idx),
           maxTokens: 8192,
           temp: 0.7,
           model: 'gemini-2.5-flash',
@@ -1186,14 +1357,14 @@ ${FORBIDDEN_EN}`;
         console.log(`[SCENES] 배치 결과: ${parsed.length}/${batch.length}`);
         if (parsed.length === 0) console.log('[SCENES] raw 첫200자:', raw.slice(0, 200));
         scenes.push(...parsed);
-        // 1번 씬 기준점 저장 (최초 1회)
-        if (parsed.length > 0 && !firstScenePrompt) {
+        // 1번 씬 기준점 저장 (최초 1회, 일반 콘텐츠만)
+        if (!isInfoContent && parsed.length > 0 && !firstScenePrompt) {
           firstScenePrompt = (parsed[0].prompt || '').slice(0, 200);
         }
-        // 다음 배치 연속성을 위해 마지막 씬 PROMPT 저장
+        // 다음 배치 연속성을 위해 마지막 씬 PROMPT 저장 (정보성은 힌트 우선이므로 짧게)
         if (parsed.length > 0) {
           const last = parsed[parsed.length - 1];
-          prevScenePrompt = (last.prompt || '').slice(0, 250);
+          prevScenePrompt = (last.prompt || '').slice(0, isInfoContent ? 120 : 250);
         }
       } catch (e) {
         console.log(`[SCENES] 배치 오류: ${e.message}`);
@@ -1212,7 +1383,7 @@ ${FORBIDDEN_EN}`;
         try {
           const raw2 = await geminiText({
             apiKey: geminiKey,
-            prompt: buildPrompt(makeBatchTemplate(batch)),
+            prompt: buildPrompt(makeBatchTemplate(batch), '', '', batch[0].idx, batch[batch.length - 1].idx),
             maxTokens: 8192,
             temp: 0.5,
             model: 'gemini-2.5-flash',
@@ -1232,6 +1403,16 @@ ${FORBIDDEN_EN}`;
     // ── 원본 스크립트 청크 씬별 저장 ────────────────────────────────────────────
     const chunkMap = Object.fromEntries(allChunks.map(({ idx, chunk }) => [idx, chunk]));
     scenes.forEach(sc => { sc.scriptChunk = chunkMap[sc.sceneNumber] || ''; });
+
+    // ── 정보성 콘텐츠: 씬별 기관/전화/사이트 오버레이 추출 ──────────────────────
+    if (isInfoContent) {
+      scenes.forEach(sc => {
+        const overlay = extractInfoOverlay(sc.scriptChunk || '');
+        if (overlay) sc.infoOverlay = overlay;
+      });
+      const overlayCount = scenes.filter(s => s.infoOverlay).length;
+      console.log(`[Scenes] infoOverlay 추출: ${overlayCount}/${scenes.length}개 장면`);
+    }
 
     // ── 캐릭터 태그 → 모든 씬 searchQuery에 자동 주입 ──────────────────────────
     let charTags = '';
@@ -1839,7 +2020,7 @@ const getAccuracyRuleKo = () => {
    - 에너지바우처: 한국에너지공단(energy.or.kr / 1600-3190)
 4. 정보가 불확실하거나 변경 가능성이 있을 경우 반드시 "정확한 내용은 [기관명] 공식 홈페이지(주소) 또는 전화번호 [번호]로 문의하세요"라고 명시하세요.
 5. 추측성·미확인 정보 작성 금지. 확인된 사실만 기술하세요.
-6. 전화번호를 언급할 때는 반드시 숫자 앞에 "전화번호"를 붙여서 TTS가 자연스럽게 읽을 수 있도록 하세요. 예) "전화번호 1357로 문의하시면 됩니다", "전화번호 1588-6565로 연락하세요" — 절대 숫자만 단독으로 쓰지 마세요.
+6. 연락처 전화번호를 언급할 때는 반드시 숫자 앞에 "전화번호"를 붙여서 TTS가 자연스럽게 읽을 수 있도록 하세요. 예) "전화번호 1357로 문의하시면 됩니다", "전화번호 1588-6565로 연락하세요". ⚠ 금액(예: 7천만 원, 2억 원, 4조 4천억 원, 25만 원)·수량·날짜·연도·퍼센트 앞에는 절대로 "전화번호"를 붙이지 마세요. 실제 연락처 번호(기관 대표번호, 콜센터 번호 등)에만 적용합니다.
 
 【실질적 내용 제시 규칙 — 포장 금지, 알맹이 필수】
 7. 각 지원 항목을 설명할 때, 해당 내용을 거론하는 바로 그 자리에 ① 정확한 프로그램명 ② 지원 금액 또는 혜택 ③ 신청 기간·마감일 ④ 신청 방법(온라인/방문/전화) ⑤ 담당 기관명·전화번호·홈페이지 주소를 함께 서술하세요. 항목 설명과 신청 정보는 반드시 같은 자리에서 거론되어야 합니다. "나중에 알아보세요" 식으로 미루는 것 금지.
@@ -3414,6 +3595,34 @@ app.post('/api/render/final', async (req, res) => {
   const VW = isShorts ? 1080 : 1920;
   const VH = isShorts ? 1920 : 1080;
   const scaleFilter = `scale=${VW}:${VH}:force_original_aspect_ratio=decrease,pad=${VW}:${VH}:(ow-iw)/2:(oh-ih)/2`;
+
+  // ── 정보성 콘텐츠 텍스트 오버레이 설정 ─────────────────────────────────────────
+  const infoTopicReRender = /지원금|정부\s*지원|복지|세금|보험|연금|의료비?|취업\s*지원|채용|대출|금리|주거급여|장려금|바우처|수당|정책|혜택\s*안내|신청\s*방법/;
+  const isInfoRender = infoTopicReRender.test(meta.topic || '') ||
+    meta.scriptTone === '정보 전달형 (명확하고 간결)' ||
+    meta.scriptTone === '뉴스형 (객관적)';
+  const FONT_PATH = 'C:/Windows/Fonts/malgun.ttf';
+  const hasFontFile = fs.existsSync(FONT_PATH);
+  // 장면번호 → infoOverlay 맵 (렌더 시 빠른 조회용)
+  const infoOverlayMap = {};
+  if (isInfoRender && hasFontFile && meta.scenes) {
+    meta.scenes.forEach(sc => {
+      if (sc.infoOverlay) infoOverlayMap[sc.sceneNumber] = sc.infoOverlay;
+    });
+    console.log(`[Render] infoOverlay 적용 가능: ${Object.keys(infoOverlayMap).length}개 장면, 폰트: ${FONT_PATH}`);
+  }
+  // drawtext 필터 문자열 생성 (FFmpeg 특수문자 이스케이프)
+  const makeInfoDrawtext = (text) => {
+    if (!text || !hasFontFile) return '';
+    const safe = text
+      .replace(/\\/g, '/')
+      .replace(/'/g, '')
+      .replace(/:/g, '\\:')
+      .replace(/\[/g, '\\[').replace(/\]/g, '\\]');
+    const fontSize = isShorts ? 34 : 30;
+    const padY     = isShorts ? 50 : 30;
+    return `drawtext=fontfile='${FONT_PATH.replace(/\\/g,'/')}':text='${safe}':fontcolor=white:fontsize=${fontSize}:box=1:boxcolor=0x000000@0.72:boxborderw=14:x=30:y=h-th-${padY}:line_spacing=4`;
+  };
   const audioDir = pDir(projectId, 'audio');
 
   // audio_full.wav 없거나 손상(< 1KB)이면 세그먼트 파일로 자동 재조립
@@ -3567,21 +3776,25 @@ app.post('/api/render/final', async (req, res) => {
 
       const PRESET = 'ultrafast'; // 중간 클립은 빠르게 (최종 합성 때 재인코딩됨)
 
-      const makeVidClip = (src, outPath, dur) => new Promise((resolve, reject) => {
+      const makeVidClip = (src, outPath, dur, overlayText = '') => new Promise((resolve, reject) => {
+        const dt  = makeInfoDrawtext(overlayText);
+        const vf  = dt ? `${scaleFilter},fps=25,${dt}` : `${scaleFilter},fps=25`;
         ffmpeg()
           .input(src).inputOptions(['-t', dur.toFixed(3)])
           .outputOptions([
-            '-vf', `${scaleFilter},fps=25`,
+            '-vf', vf,
             '-c:v', 'libx264', '-crf', '23', '-preset', PRESET, '-an', '-pix_fmt', 'yuv420p'
           ])
           .output(outPath).on('end', resolve).on('error', reject).run();
       });
 
-      const makeImgClip = (src, outPath, dur) => new Promise((resolve, reject) => {
+      const makeImgClip = (src, outPath, dur, overlayText = '') => new Promise((resolve, reject) => {
+        const dt  = makeInfoDrawtext(overlayText);
+        const vf  = dt ? `${scaleFilter},fps=25,${dt}` : `${scaleFilter},fps=25`;
         ffmpeg()
           .input(src).inputOptions(['-loop', '1', '-t', dur.toFixed(3)])
           .outputOptions([
-            '-vf', `${scaleFilter},fps=25`,
+            '-vf', vf,
             '-c:v', 'libx264', '-crf', '23', '-preset', PRESET, '-an', '-pix_fmt', 'yuv420p',
             '-t', dur.toFixed(3)
           ])
@@ -3589,11 +3802,13 @@ app.post('/api/render/final', async (req, res) => {
       });
 
       // ── 루프 모드: 영상 클립을 장면 전체 시간 동안 반복 재생 ─────────────────
-      const makeLoopVidClip = (src, outPath, dur) => new Promise((resolve, reject) => {
+      const makeLoopVidClip = (src, outPath, dur, overlayText = '') => new Promise((resolve, reject) => {
+        const dt  = makeInfoDrawtext(overlayText);
+        const vf  = dt ? `${scaleFilter},fps=25,${dt}` : `${scaleFilter},fps=25`;
         ffmpeg()
           .input(src).inputOptions(['-stream_loop', '-1', '-t', dur.toFixed(3)])
           .outputOptions([
-            '-vf', `${scaleFilter},fps=25`,
+            '-vf', vf,
             '-c:v', 'libx264', '-crf', '23', '-preset', PRESET, '-an', '-pix_fmt', 'yuv420p',
             '-t', dur.toFixed(3)
           ])
@@ -3601,11 +3816,15 @@ app.post('/api/render/final', async (req, res) => {
       });
 
       // ── 검은 화면 클립 (이미지 없는 장면용) ──────────────────────────────────
-      const makeBlackClip = (outPath, dur) => new Promise((resolve, reject) => {
+      const makeBlackClip = (outPath, dur, overlayText = '') => new Promise((resolve, reject) => {
+        const dt      = makeInfoDrawtext(overlayText);
+        const baseVF  = `${scaleFilter},fps=25`;
+        const filters = dt ? [`${baseVF},${dt}`] : [baseVF];
         ffmpeg()
           .input(`color=black:s=${VW}x${VH}:r=25`)
           .inputOptions(['-f', 'lavfi', '-t', dur.toFixed(3)])
           .outputOptions([
+            '-vf', filters[0],
             '-c:v', 'libx264', '-crf', '23', '-preset', PRESET, '-an', '-pix_fmt', 'yuv420p',
             '-t', dur.toFixed(3)
           ])
@@ -3613,11 +3832,11 @@ app.post('/api/render/final', async (req, res) => {
       });
 
       // ── 오버레이 1회 모드: 이미지 배경 + 영상 클립 1회 재생 → 나머지 이미지 ──
-      const makeOverlayOnceClip = (imgSrc, vidSrc, outPath, dur) => new Promise((resolve, reject) => {
-        const overlayFilter =
-          `[0:v]${scaleFilter}[bg];` +
-          `[1:v]${scaleFilter}[fg];` +
-          '[bg][fg]overlay=0:0';
+      const makeOverlayOnceClip = (imgSrc, vidSrc, outPath, dur, overlayText = '') => new Promise((resolve, reject) => {
+        const dt = makeInfoDrawtext(overlayText);
+        const overlayFilter = dt
+          ? `[0:v]${scaleFilter}[bg];[1:v]${scaleFilter}[fg];[bg][fg]overlay=0:0[combined];[combined]${dt}`
+          : `[0:v]${scaleFilter}[bg];[1:v]${scaleFilter}[fg];[bg][fg]overlay=0:0`;
         ffmpeg()
           .input(imgSrc).inputOptions(['-loop', '1', '-t', dur.toFixed(3)])
           .input(vidSrc)
@@ -3640,12 +3859,13 @@ app.post('/api/render/final', async (req, res) => {
       for (let b = 0; b < lastIdx; b += PARALLEL) {
         const batch = allNums.slice(b, Math.min(b + PARALLEL, lastIdx));
         await Promise.all(batch.map(async (num, bi) => {
-          const i       = b + bi;
-          const pfx     = `clip_${String(i).padStart(3, '0')}`;
-          const hasVid  = !!vidMap[num];
-          const hasImg  = !!imgMap[num];
-          const clipDur = segDuration;
-          const clipPct = 15 + Math.round(((b + bi + 1) / allNums.length) * 55);
+          const i           = b + bi;
+          const pfx         = `clip_${String(i).padStart(3, '0')}`;
+          const hasVid      = !!vidMap[num];
+          const hasImg      = !!imgMap[num];
+          const clipDur     = segDuration;
+          const clipPct     = 15 + Math.round(((b + bi + 1) / allNums.length) * 55);
+          const overlayText = infoOverlayMap[num] || '';
           sseSend(res, { type: 'progress', pct: clipPct, msg: `장면 ${i + 1}/${allNums.length} 처리 중… (scene_${num})` });
 
           if (hasVid && hasImg) {
@@ -3653,24 +3873,24 @@ app.post('/api/render/final', async (req, res) => {
             const imgSrc  = path.join(imgDir,   imgMap[num]);
             const clipPath = path.join(procDir, `${pfx}.mp4`);
             if (videoRenderMode === 'loop') {
-              await makeLoopVidClip(vidSrc, clipPath, clipDur);
+              await makeLoopVidClip(vidSrc, clipPath, clipDur, overlayText);
             } else {
-              await makeOverlayOnceClip(imgSrc, vidSrc, clipPath, clipDur);
+              await makeOverlayOnceClip(imgSrc, vidSrc, clipPath, clipDur, overlayText);
             }
             clipMap[i] = [clipPath];
           } else if (hasVid) {
             const clipPath = path.join(procDir, `${pfx}.mp4`);
             const src = path.join(videoDir, vidMap[num]);
             if (videoRenderMode === 'loop') {
-              await makeLoopVidClip(src, clipPath, clipDur);
+              await makeLoopVidClip(src, clipPath, clipDur, overlayText);
             } else {
-              await makeVidClip(src, clipPath, clipDur);
+              await makeVidClip(src, clipPath, clipDur, overlayText);
             }
             clipMap[i] = [clipPath];
           } else if (hasImg) {
             const clipPath = path.join(procDir, `${pfx}.mp4`);
             const src = path.join(imgDir, imgMap[num]);
-            await makeImgClip(src, clipPath, clipDur);
+            await makeImgClip(src, clipPath, clipDur, overlayText);
             clipMap[i] = [clipPath];
           } else {
             clipMap[i] = []; // 미디어 없음
@@ -3680,12 +3900,13 @@ app.post('/api/render/final', async (req, res) => {
 
       // 마지막 장면 처리 (별도 — 특수 로직 있음)
       if (allNums.length > 0) {
-        const i      = lastIdx;
-        const num    = allNums[i];
-        const pfx    = `clip_${String(i).padStart(3, '0')}`;
-        const hasVid = !!vidMap[num];
-        const hasImg = !!imgMap[num];
-        const clipDur = segDuration + 0.5;
+        const i           = lastIdx;
+        const num         = allNums[i];
+        const pfx         = `clip_${String(i).padStart(3, '0')}`;
+        const hasVid      = !!vidMap[num];
+        const hasImg      = !!imgMap[num];
+        const clipDur     = segDuration + 0.5;
+        const overlayText = infoOverlayMap[num] || '';
         sseSend(res, { type: 'progress', pct: 70, msg: `마지막 장면 처리 중… (scene_${num})` });
 
         if (hasVid) {
@@ -3693,16 +3914,16 @@ app.post('/api/render/final', async (req, res) => {
           const actualVidDur = await getVideoDuration(vidSrc);
           const imgClipPath  = path.join(procDir, `${pfx}_a.mp4`);
           if (hasImg) {
-            await makeImgClip(path.join(imgDir, imgMap[num]), imgClipPath, clipDur);
+            await makeImgClip(path.join(imgDir, imgMap[num]), imgClipPath, clipDur, overlayText);
           } else {
-            await makeBlackClip(imgClipPath, clipDur);
+            await makeBlackClip(imgClipPath, clipDur, overlayText);
           }
           const vidClipPath = path.join(procDir, `${pfx}_b.mp4`);
-          await makeVidClip(vidSrc, vidClipPath, actualVidDur);
+          await makeVidClip(vidSrc, vidClipPath, actualVidDur, overlayText);
           clipMap[i] = [imgClipPath, vidClipPath];
         } else if (hasImg) {
           const clipPath = path.join(procDir, `${pfx}.mp4`);
-          await makeImgClip(path.join(imgDir, imgMap[num]), clipPath, clipDur);
+          await makeImgClip(path.join(imgDir, imgMap[num]), clipPath, clipDur, overlayText);
           clipMap[i] = [clipPath];
         } else {
           clipMap[i] = [];
