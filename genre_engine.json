@@ -1,0 +1,921 @@
+{
+  "_meta": {
+    "version": "2.0.0",
+    "description": "GENRE_ENGINE — 장르별 제작 파라미터 정의. server.js의 meta 객체와 직접 연결 가능.",
+    "connect": {
+      "detectInfoContent": "meta.genre 기반으로 교체 예정 (현재 INFO_TOPIC_RE + scriptTone 분기 대체)",
+      "buildPrompt": "genre.prompt_rules + genre.forbidden_prompt_keywords → PROMPT 규칙 주입",
+      "geminiTTS": "genre.tts.voice → voiceName, genre.tts.speed → speed, genre.tts.system_prompt_hint → TTS prefix",
+      "imageGeneration": "genre.camera + genre.lens → PROMPT 접두어로 삽입",
+      "bgm": "genre.music → 검색 키워드 또는 UI 기본값",
+      "subtitle": "genre.subtitle → FFmpeg drawtext 파라미터",
+      "narrativeBlock": "genre.biblical_accuracy_rules → 대본 생성 지침 주입",
+      "resolveGenre": "genre.negative_regex → 오분류 방지 탈락 조건"
+    }
+  },
+
+  "genres": {
+
+    "classic_literature": {
+      "code": "classic_literature",
+      "label": "고전문학",
+      "label_en": "Classic Literature",
+      "description": "고전소설·수필·시조 기반 영상. 고풍스러운 미장센과 정서적 깊이 중시.",
+      "scriptTone_mapping": ["따뜻하고 잔잔한 이야기형", "감동 사연형 (공감 위주)"],
+      "is_info_content": false,
+
+      "image": {
+        "recommended_style": "Cinematic Illustration, warm tones, classical Korean aesthetic",
+        "fallback_style": "Realistic Painting",
+        "style_hint": "traditional Korean setting, muted warm palette, hand-painted texture, 조선시대 or 근현대 배경"
+      },
+
+      "camera": {
+        "primary_shots": ["slow push-in medium shot", "wide establishing shot", "low-angle reverence shot"],
+        "avoid": ["handheld shaky cam", "extreme close-up of text/objects"],
+        "movement": "slow, deliberate, contemplative — no fast cuts",
+        "prompt_prefix": "slow cinematic push-in, classical Korean setting, painterly composition,"
+      },
+
+      "lens": {
+        "type": "standard to mild telephoto (50mm–85mm equivalent)",
+        "depth_of_field": "moderate — subject sharp, background softly blurred",
+        "effect": "soft vignette edges, warm color grade, subtle film grain",
+        "prompt_fragment": "85mm lens, soft bokeh background, warm vintage film grain, subtle vignette"
+      },
+
+      "lighting": {
+        "style": "natural ambient — golden hour, candlelight interior, overcast daylight",
+        "color_temp": "warm (3200K–4500K)",
+        "shadows": "soft, long shadows",
+        "prompt_fragment": "golden hour soft natural lighting, warm amber glow, long gentle shadows"
+      },
+
+      "tts": {
+        "voice": "Leda",
+        "speed": "slow",
+        "style_note": "부드럽고 안정감 있는 여성 — 고전 낭독체, 천천히 읽는 느낌",
+        "system_prompt_hint": "Read in a slow, reverent storytelling tone as if reciting classical Korean literature"
+      },
+
+      "music": {
+        "mood": "고즈넉한, 서정적, 전통적",
+        "keywords": ["korean traditional", "haegeum", "daegeum", "ambient classical", "nostalgia"],
+        "bpm_range": [50, 75],
+        "volume_default": 0.18,
+        "avoid": ["electronic", "upbeat pop", "heavy beat"]
+      },
+
+      "subtitle": {
+        "style": "elegant_serif",
+        "fontsize": 28,
+        "fontcolor": "#F5E6C8",
+        "box": true,
+        "boxcolor": "0x1A0A00@0.65",
+        "position": "bottom_center",
+        "line_spacing": 6,
+        "note": "따뜻한 베이지 계열 — 고전 서체 느낌"
+      },
+
+      "continuity": {
+        "importance": "very_high",
+        "score": 10,
+        "rules": [
+          "인물 복장·시대 의상 전 씬 동일 유지",
+          "배경 시대 고증 일관성 (조선/근현대 혼용 금지)",
+          "감정 arc 전체 추적 필수 (story_context.json 활용)",
+          "첫 씬 PROMPT를 기준점으로 끝까지 유지"
+        ],
+        "use_story_context": true,
+        "use_first_scene_anchor": true
+      },
+
+      "scene": {
+        "default_duration_sec": 6,
+        "min_duration_sec": 4,
+        "max_duration_sec": 10,
+        "pacing": "slow — 한 장면에 충분히 머무름",
+        "scene_count_per_min": 3
+      },
+
+      "emotion": {
+        "default_mood": "nostalgic_warmth",
+        "keywords": ["그리움", "회한", "서정", "인내", "이별", "그리움"],
+        "color_grade": "warm sepia — golden amber tones",
+        "arc_type": "slow_build_emotional_release"
+      },
+
+      "prompt_rules": {
+        "visual_diversity": false,
+        "scene_independence": false,
+        "presenter_required": false,
+        "forbidden_in_prompt": ["modern objects", "smartphones", "neon signs", "현대 건물"],
+        "required_in_prompt": ["traditional Korean aesthetic", "period-appropriate setting"]
+      }
+    },
+
+    "news": {
+      "code": "news",
+      "label": "뉴스",
+      "label_en": "News / Report",
+      "description": "시사·정책·사회 이슈 보도형. 객관성과 신뢰감 중시.",
+      "scriptTone_mapping": ["뉴스형 (객관적)", "정보 전달형 (명확하고 간결)"],
+      "is_info_content": true,
+
+      "image": {
+        "recommended_style": "Photorealistic, clean neutral tones, broadcast-quality",
+        "fallback_style": "Cinematic realistic photography",
+        "style_hint": "neutral background, professional environment, sharp focus, broadcast studio or field report aesthetic"
+      },
+
+      "camera": {
+        "primary_shots": ["medium shot — anchor/presenter", "wide establishing shot — event scene", "B-roll cutaway"],
+        "avoid": ["extreme close-up of faces", "fisheye", "artistic blur"],
+        "movement": "static or slow pan — no camera shake",
+        "prompt_prefix": "static broadcast medium shot, neutral clean background, sharp focus,"
+      },
+
+      "lens": {
+        "type": "standard (35mm–50mm equivalent) — minimal distortion",
+        "depth_of_field": "deep focus — subject and background both sharp",
+        "effect": "clean, no grain, neutral color correction",
+        "prompt_fragment": "50mm lens, deep focus, clean neutral color grade, broadcast quality"
+      },
+
+      "lighting": {
+        "style": "3-point studio lighting or natural daylight exterior",
+        "color_temp": "neutral (5500K–6500K)",
+        "shadows": "minimal, fill-lit",
+        "prompt_fragment": "neutral studio three-point lighting, clean fill light, professional broadcast quality"
+      },
+
+      "tts": {
+        "voice": "Charon",
+        "speed": "normal",
+        "style_note": "신뢰감 있는 중저음 남성 — 뉴스 앵커 톤",
+        "system_prompt_hint": "Read in a calm, authoritative news anchor tone — clear articulation, neutral pace"
+      },
+
+      "music": {
+        "mood": "차분한, 신뢰감, 긴장감 없는 배경",
+        "keywords": ["news background", "corporate ambient", "minimal piano", "neutral underscore"],
+        "bpm_range": [60, 90],
+        "volume_default": 0.10,
+        "avoid": ["emotional swells", "traditional instruments", "heavy bass"]
+      },
+
+      "subtitle": {
+        "style": "clean_sans",
+        "fontsize": 30,
+        "fontcolor": "#FFFFFF",
+        "box": true,
+        "boxcolor": "0x003366@0.80",
+        "position": "bottom_left",
+        "line_spacing": 4,
+        "note": "뉴스 자막바 스타일 — 파란 배경 흰 글씨"
+      },
+
+      "continuity": {
+        "importance": "low",
+        "score": 3,
+        "rules": [
+          "각 씬은 독립된 보도 장면",
+          "같은 배경 2회 이상 연속 금지",
+          "진행자 외모 일관성만 유지"
+        ],
+        "use_story_context": false,
+        "use_first_scene_anchor": false,
+        "scene_independence": true,
+        "visual_diversity_required": true
+      },
+
+      "scene": {
+        "default_duration_sec": 4,
+        "min_duration_sec": 3,
+        "max_duration_sec": 6,
+        "pacing": "brisk — 정보 밀도 높음",
+        "scene_count_per_min": 8
+      },
+
+      "emotion": {
+        "default_mood": "neutral_objective",
+        "keywords": ["분석", "보도", "사실", "현장"],
+        "color_grade": "neutral — balanced whites, no heavy grade",
+        "arc_type": "flat_informational"
+      },
+
+      "prompt_rules": {
+        "visual_diversity": true,
+        "scene_independence": true,
+        "presenter_required": true,
+        "info_overlay_enabled": true,
+        "forbidden_in_prompt": ["emotional expressions", "dramatic lighting", "fantasy elements"],
+        "required_in_prompt": ["neutral professional setting", "real-world context"]
+      }
+    },
+
+    "senior_info": {
+      "code": "senior_info",
+      "label": "시니어정보",
+      "label_en": "Senior Information",
+      "description": "중장년·노년층 대상 생활 정보·복지·건강 콘텐츠. 큰 가독성과 따뜻한 톤.",
+      "scriptTone_mapping": ["정보 전달형 (명확하고 간결)", "따뜻하고 잔잔한 이야기형"],
+      "is_info_content": true,
+      "senior_mode": true,
+
+      "image": {
+        "recommended_style": "Photorealistic, warm golden tones, emotionally authentic",
+        "fallback_style": "Cinematic realistic photography",
+        "style_hint": "warm golden light, genuine aged faces with expressive wrinkles, family moments, everyday Korean life, never idealized or youthful"
+      },
+
+      "camera": {
+        "primary_shots": ["medium shot — elderly person in natural setting", "close-up — expressive face", "wide — family or community scene"],
+        "avoid": ["harsh angle", "clinical cold lighting", "abstract compositions"],
+        "movement": "slow, gentle — no sudden cuts",
+        "prompt_prefix": "warm medium shot, elderly Korean person, gentle natural lighting, emotionally authentic,"
+      },
+
+      "lens": {
+        "type": "mild telephoto (85mm equivalent) — flattering, no distortion",
+        "depth_of_field": "shallow — subject warm, background soft",
+        "effect": "warm golden tone, soft vignette, no film grain",
+        "prompt_fragment": "85mm lens, warm golden bokeh, soft natural vignette, emotionally warm color grade"
+      },
+
+      "lighting": {
+        "style": "warm natural — morning window light, golden hour outdoor",
+        "color_temp": "warm (3000K–4000K)",
+        "shadows": "very soft — fill-lit, no harsh shadows",
+        "prompt_fragment": "warm morning window light, golden soft fill, gentle shadows, comforting atmosphere"
+      },
+
+      "tts": {
+        "voice": "Leda",
+        "speed": "slow",
+        "style_note": "부드럽고 안정감 있는 여성 — 천천히, 명확하게",
+        "system_prompt_hint": "Read slowly and warmly, as if speaking to an elderly person — clear pronunciation, gentle pace, no rushing"
+      },
+
+      "music": {
+        "mood": "따뜻한, 안심되는, 가족적",
+        "keywords": ["warm acoustic guitar", "soft piano", "family ambient", "comforting melody"],
+        "bpm_range": [55, 75],
+        "volume_default": 0.15,
+        "avoid": ["electronic", "fast tempo", "heavy beat", "dark chords"]
+      },
+
+      "subtitle": {
+        "style": "large_clear",
+        "fontsize": 36,
+        "fontcolor": "#FFFFFF",
+        "box": true,
+        "boxcolor": "0x000000@0.75",
+        "position": "bottom_center",
+        "line_spacing": 8,
+        "note": "시니어 가독성 최우선 — 폰트 크기 36px, 넉넉한 줄간격"
+      },
+
+      "continuity": {
+        "importance": "medium",
+        "score": 5,
+        "rules": [
+          "진행자 외모 일관성 유지",
+          "따뜻한 색온도 전 씬 유지",
+          "시니어 인물 등장 시 genuine aged face 유지 (젊게 표현 금지)",
+          "각 씬은 정보 주제별 독립 가능"
+        ],
+        "use_story_context": false,
+        "use_first_scene_anchor": false,
+        "scene_independence": true,
+        "visual_diversity_required": true,
+        "senior_mood_hint": "Mood: emotionally warm and nostalgic. Prefer warm golden tones, soft natural lighting. If people appear, show genuine aged faces with expressive wrinkles and kind eyes — never idealized or youthful."
+      },
+
+      "scene": {
+        "default_duration_sec": 6,
+        "min_duration_sec": 5,
+        "max_duration_sec": 9,
+        "pacing": "slow-moderate — 이해하기 쉽게 여유 있게",
+        "scene_count_per_min": 5
+      },
+
+      "emotion": {
+        "default_mood": "warm_reassuring",
+        "keywords": ["안심", "가족", "건강", "일상", "행복", "따뜻함"],
+        "color_grade": "warm amber — golden tones, high warmth",
+        "arc_type": "flat_warm_informational"
+      },
+
+      "prompt_rules": {
+        "visual_diversity": true,
+        "scene_independence": true,
+        "presenter_required": true,
+        "info_overlay_enabled": true,
+        "forbidden_in_prompt": ["cold blue tones", "young idealized faces for elderly characters", "clinical setting"],
+        "required_in_prompt": ["warm golden tones", "authentic elderly Korean", "everyday life setting"]
+      }
+    },
+
+    "overseas_touching": {
+      "code": "overseas_touching",
+      "label": "해외감동사연",
+      "label_en": "Overseas Heartwarming Story",
+      "description": "해외 거주 교포·외국인의 감동 실화 기반. 이국적 배경 + 인간적 감동.",
+      "scriptTone_mapping": ["감동 사연형 (공감 위주)", "따뜻하고 잔잔한 이야기형"],
+      "is_info_content": false,
+
+      "image": {
+        "recommended_style": "Cinematic realistic photography, emotionally rich, multicultural setting",
+        "fallback_style": "Cinematic Illustration",
+        "style_hint": "overseas setting (Europe/US/Asia), multicultural characters, genuine emotional expressions, documentary-drama hybrid feel"
+      },
+
+      "camera": {
+        "primary_shots": ["close-up — emotional face", "medium shot — interaction between characters", "wide — foreign cityscape or landscape"],
+        "avoid": ["abstract shots", "overly stylized angles"],
+        "movement": "handheld-feel (subtle) for intimacy, slow push-in for emotional peaks",
+        "prompt_prefix": "intimate handheld-feel medium shot, multicultural setting, warm emotional lighting,"
+      },
+
+      "lens": {
+        "type": "wide to mild telephoto (28mm–85mm) — versatile storytelling",
+        "depth_of_field": "shallow for emotional close-ups, deep for establishing shots",
+        "effect": "cinematic color grade, slight film grain, anamorphic lens flare on key moments",
+        "prompt_fragment": "cinematic 50mm lens, shallow depth of field, anamorphic lens flare, warm filmic color grade"
+      },
+
+      "lighting": {
+        "style": "golden hour outdoor, warm interior practicals, emotional backlight",
+        "color_temp": "warm to neutral (4000K–5500K)",
+        "shadows": "moderate — adds depth and drama",
+        "prompt_fragment": "golden hour backlight, warm emotional rim lighting, cinematic shadows, depth"
+      },
+
+      "tts": {
+        "voice": "Aoede",
+        "speed": "normal",
+        "style_note": "차분하고 따뜻한 여성 — 감동 다큐 내레이션",
+        "system_prompt_hint": "Read in a warm, heartfelt narrative tone — like narrating a touching real-life documentary"
+      },
+
+      "music": {
+        "mood": "감동적인, 희망적인, 이국적 느낌",
+        "keywords": ["emotional cinematic", "inspirational", "world music ambient", "heartfelt strings", "piano and strings"],
+        "bpm_range": [60, 85],
+        "volume_default": 0.20,
+        "avoid": ["korean traditional only", "fast electronic", "dark minor chords"]
+      },
+
+      "subtitle": {
+        "style": "cinematic_white",
+        "fontsize": 30,
+        "fontcolor": "#FFFFFF",
+        "box": true,
+        "boxcolor": "0x000000@0.60",
+        "position": "bottom_center",
+        "line_spacing": 5,
+        "note": "영화 자막 스타일 — 반투명 박스"
+      },
+
+      "continuity": {
+        "importance": "high",
+        "score": 8,
+        "rules": [
+          "인물 외모 (인종·복장) 전 씬 일관 유지",
+          "배경 국가·도시 일관성 유지",
+          "감정 arc 추적 (story_context.json 활용)",
+          "첫 씬 PROMPT 기준점 유지"
+        ],
+        "use_story_context": true,
+        "use_first_scene_anchor": true
+      },
+
+      "scene": {
+        "default_duration_sec": 5,
+        "min_duration_sec": 4,
+        "max_duration_sec": 8,
+        "pacing": "moderate — 감동 포인트에서 속도 낮춤",
+        "scene_count_per_min": 5
+      },
+
+      "emotion": {
+        "default_mood": "hopeful_touching",
+        "keywords": ["감동", "희망", "극복", "그리움", "재회", "성공"],
+        "color_grade": "warm cinematic — golden tones with slight desaturation in sad moments",
+        "arc_type": "classic_three_act_emotional"
+      },
+
+      "prompt_rules": {
+        "visual_diversity": false,
+        "scene_independence": false,
+        "presenter_required": false,
+        "forbidden_in_prompt": ["Korean-only setting (mix with overseas)", "text/subtitles in image"],
+        "required_in_prompt": ["overseas cultural context", "multicultural characters", "cinematic atmosphere"]
+      }
+    },
+
+    "history": {
+      "code": "history",
+      "label": "역사",
+      "label_en": "History",
+      "description": "한국사·세계사 다큐멘터리. 역사적 고증과 장엄함 중시.",
+      "scriptTone_mapping": ["분석형 (논리적)", "정보 전달형 (명확하고 간결)"],
+      "is_info_content": false,
+
+      "image": {
+        "recommended_style": "Cinematic Illustration, historical accuracy, epic scale",
+        "fallback_style": "Realistic Painting",
+        "style_hint": "historically accurate setting, period-correct costumes, epic composition, documentary drama aesthetic — BBC/National Geographic style"
+      },
+
+      "camera": {
+        "primary_shots": ["wide establishing — historical landscape or battlefield", "medium shot — historical figure", "slow crane-like move — epic reveal"],
+        "avoid": ["modern visual cues", "fast MTV editing"],
+        "movement": "slow, deliberate, majestic — epic documentary pacing",
+        "prompt_prefix": "epic wide establishing shot, historically accurate, dramatic cinematic composition,"
+      },
+
+      "lens": {
+        "type": "wide to ultra-wide (24mm–35mm) for epic scale",
+        "depth_of_field": "deep focus — epic landscapes, shallow for portrait moments",
+        "effect": "slight desaturation, filmic grain, dramatic vignette",
+        "prompt_fragment": "24mm wide lens, epic depth of field, dramatic cinematic vignette, desaturated historical color grade"
+      },
+
+      "lighting": {
+        "style": "dramatic natural — harsh sunlight, stormy skies, torch/fire interior",
+        "color_temp": "cool to neutral (5000K–6500K) with warm fire accents",
+        "shadows": "dramatic, hard — chiaroscuro for intense moments",
+        "prompt_fragment": "dramatic overcast sunlight, harsh directional light, deep shadows, epic atmospheric lighting"
+      },
+
+      "tts": {
+        "voice": "Charon",
+        "speed": "normal",
+        "style_note": "신뢰감 있는 중저음 남성 — 역사 다큐 나레이터",
+        "system_prompt_hint": "Read in a deep, authoritative documentary narrator tone — measured, grave, commanding respect"
+      },
+
+      "music": {
+        "mood": "장엄한, 웅장한, 서사적",
+        "keywords": ["epic orchestral", "historical documentary", "dramatic brass", "war drums", "cinematic score"],
+        "bpm_range": [60, 110],
+        "volume_default": 0.22,
+        "avoid": ["pop", "electronic", "light acoustic"]
+      },
+
+      "subtitle": {
+        "style": "documentary_dark",
+        "fontsize": 30,
+        "fontcolor": "#F0E8D0",
+        "box": true,
+        "boxcolor": "0x0A0500@0.75",
+        "position": "bottom_center",
+        "line_spacing": 5,
+        "note": "역사 다큐 자막 — 어두운 배경 + 크림 컬러 텍스트"
+      },
+
+      "continuity": {
+        "importance": "high",
+        "score": 8,
+        "rules": [
+          "시대 고증 전 씬 일관 (복장·건축·소품)",
+          "역사적 인물 외모 묘사 일관",
+          "시대 전환 시 명확한 시각 단서 필요",
+          "story_context.json의 location·costume 추적"
+        ],
+        "use_story_context": true,
+        "use_first_scene_anchor": true
+      },
+
+      "scene": {
+        "default_duration_sec": 6,
+        "min_duration_sec": 5,
+        "max_duration_sec": 10,
+        "pacing": "slow-moderate — 장엄한 장면에 충분한 시간",
+        "scene_count_per_min": 4
+      },
+
+      "emotion": {
+        "default_mood": "epic_gravitas",
+        "keywords": ["장엄", "비장", "의지", "희생", "역사의 무게"],
+        "color_grade": "desaturated cool — grey-blue with warm fire accents",
+        "arc_type": "historical_arc_build_to_climax"
+      },
+
+      "prompt_rules": {
+        "visual_diversity": false,
+        "scene_independence": false,
+        "presenter_required": false,
+        "forbidden_in_prompt": ["modern objects", "현대 건물", "smartphones", "현대식 의복"],
+        "required_in_prompt": ["historically accurate setting", "period-correct Korean or world costume", "epic scale composition"]
+      }
+    },
+
+    "korean_pride": {
+      "code": "korean_pride",
+      "label": "국뽕",
+      "label_en": "Korean Pride",
+      "description": "한국 문화·기술·스포츠·군사 우수성 강조. 자긍심과 역동성 중시.",
+      "scriptTone_mapping": ["분석형 (논리적)", "정보 전달형 (명확하고 간결)"],
+      "is_info_content": false,
+
+      "image": {
+        "recommended_style": "Cinematic realistic photography, vivid colors, high energy",
+        "fallback_style": "Dark Cinematic",
+        "style_hint": "vibrant Korean cultural elements, dynamic composition, patriotic energy, high contrast vivid colors, modern Korea aesthetic"
+      },
+
+      "camera": {
+        "primary_shots": ["low-angle hero shot — looking up", "dynamic wide — crowd/stadium/city", "fast push-in — reveal shot"],
+        "avoid": ["slow melancholic shots", "muted colors", "sad expressions"],
+        "movement": "dynamic — slow motion for impact, bold angles, energetic pacing",
+        "prompt_prefix": "dramatic low-angle hero shot, vibrant vivid colors, dynamic powerful composition,"
+      },
+
+      "lens": {
+        "type": "wide to mild telephoto (24mm–50mm) — dramatic perspective",
+        "depth_of_field": "moderate — epic depth, subject stands out",
+        "effect": "high contrast, vivid saturation boost, dramatic lens flare, anamorphic widescreen",
+        "prompt_fragment": "24mm wide-angle lens, dramatic hero perspective, high contrast vivid colors, anamorphic lens flare, widescreen"
+      },
+
+      "lighting": {
+        "style": "dramatic — strong directional light, rim lighting, golden hour epic",
+        "color_temp": "dynamic — warm gold for triumph, cool blue for military/tech",
+        "shadows": "strong, dramatic — adds power",
+        "prompt_fragment": "dramatic golden rim lighting, powerful directional key light, deep contrast shadows, epic heroic atmosphere"
+      },
+
+      "tts": {
+        "voice": "Fenrir",
+        "speed": "normal",
+        "style_note": "강하고 권위있는 남성 — 자긍심 넘치는 설득형",
+        "system_prompt_hint": "Read with confident, powerful energy — proud, assertive, like a motivational Korean narrator celebrating national achievement"
+      },
+
+      "music": {
+        "mood": "웅장한, 자랑스러운, 역동적",
+        "keywords": ["epic cinematic triumph", "korean percussion", "powerful orchestral", "national pride anthem", "dynamic buildup"],
+        "bpm_range": [90, 130],
+        "volume_default": 0.25,
+        "avoid": ["melancholic", "soft ambient", "slow tempo"]
+      },
+
+      "subtitle": {
+        "style": "bold_impact",
+        "fontsize": 34,
+        "fontcolor": "#FFFFFF",
+        "box": true,
+        "boxcolor": "0xC8001A@0.75",
+        "position": "bottom_center",
+        "line_spacing": 5,
+        "note": "국뽕 자막 — 태극기 레드 배경 + 흰 글씨 임팩트"
+      },
+
+      "continuity": {
+        "importance": "medium",
+        "score": 6,
+        "rules": [
+          "인물 외모·복장 일관성 유지",
+          "한국 문화 요소 일관 (한복, 태극기, K-culture)",
+          "에너지 톤 전 씬 유지 — 급격한 분위기 하강 금지"
+        ],
+        "use_story_context": false,
+        "use_first_scene_anchor": true
+      },
+
+      "scene": {
+        "default_duration_sec": 4,
+        "min_duration_sec": 3,
+        "max_duration_sec": 7,
+        "pacing": "fast-moderate — 역동적이고 빠른 전개",
+        "scene_count_per_min": 7
+      },
+
+      "emotion": {
+        "default_mood": "proud_triumphant",
+        "keywords": ["자랑스러움", "승리", "역동", "힘", "도전", "성취"],
+        "color_grade": "vivid high-contrast — saturated reds, deep blues, bright whites",
+        "arc_type": "escalating_triumph"
+      },
+
+      "prompt_rules": {
+        "visual_diversity": true,
+        "scene_independence": false,
+        "presenter_required": false,
+        "forbidden_in_prompt": ["sad or defeated expressions", "muted colors", "foreign cultural dominance over Korean"],
+        "required_in_prompt": ["dynamic powerful composition", "Korean cultural pride elements", "vivid energetic colors"]
+      }
+    },
+
+    "bible_drama": {
+      "code": "bible_drama",
+      "label": "성경드라마",
+      "label_en": "Bible Drama",
+      "description": "성경 본문에 근거한 서사를 Sacred Realism으로 시각화. 인물의 인간적 감정·믿음·고난을 사실적으로 묘사. 신화·판타지·마법 연출 일절 금지.",
+      "scriptTone_mapping": ["감동 사연형 (공감 위주)", "따뜻하고 잔잔한 이야기형"],
+      "is_info_content": false,
+      "content_mode": "narrative",
+
+      "image": {
+        "recommended_style": "Cinematic Illustration, sacred realism, historically grounded ancient Middle East",
+        "fallback_style": "Realistic Painting — classical biblical art style (Rembrandt, Caravaggio tone)",
+        "style_hint": "ancient Middle East setting, historically accurate biblical costumes — robes, sandals, head coverings; desert and stone architecture; natural sacred light; human expressions of faith, struggle, and devotion",
+        "forbidden_styles": ["AI fantasy art", "hyper-saturated digital art", "Norse mythology aesthetic", "Greek mythology aesthetic", "anime or cartoon style", "dark fantasy", "high fantasy epic", "magical realism with glowing effects"]
+      },
+
+      "camera": {
+        "primary_shots": ["slow push-in medium shot — human face in prayer, struggle, or wonder", "wide establishing — ancient desert city, temple courtyard, or crowd gathering", "low-angle dignified shot — person of faith standing firm", "intimate close-up — hands clasped in prayer, tears on face, bread being broken"],
+        "avoid": ["handheld shaky cam", "fast MTV-style cuts", "cold blue fantasy tones", "glowing magical visual effects", "over-stylized fantasy camera angles"],
+        "movement": "slow, reverent, human-scale — camera follows human experience, not spectacle",
+        "prompt_prefix": "sacred realism cinematic shot, ancient biblical setting, warm natural light, human emotion focus,"
+      },
+
+      "lens": {
+        "type": "standard to mild telephoto (50mm–85mm) — human-scale portraiture",
+        "depth_of_field": "moderate shallow — subject sharp, background naturally blurred",
+        "effect": "warm natural sunlight, soft diffused desert haze, gentle golden hour glow — NO artificial god-rays, NO magic particle effects",
+        "prompt_fragment": "85mm lens, warm natural golden-hour light, soft depth of field, historically grounded cinematic tone"
+      },
+
+      "lighting": {
+        "style": "natural sacred — desert sun, oil lamp interior, campfire, dawn over landscape",
+        "color_temp": "warm natural (3800K–5000K) — sunrise gold, oil lamp amber, midday desert",
+        "shadows": "natural directional shadows — honest light from a real source",
+        "prompt_fragment": "warm natural desert sunlight, oil lamp amber interior, honest directional shadows, sacred human atmosphere"
+      },
+
+      "tts": {
+        "voice": "Charon",
+        "speed": "slow",
+        "style_note": "신뢰감 있는 중저음 남성 — 성경 낭독체, 경건하고 차분하게",
+        "system_prompt_hint": "Read as if narrating sacred scripture with deep reverence — slow, weighted, each word clear and meaningful. NOT dramatic or theatrical, but honest and devout"
+      },
+
+      "music": {
+        "mood": "경건한, 인간적 감동, 진실한 신앙, 고요한 장엄함",
+        "keywords": ["sacred chamber music", "biblical realism score", "ancient middle east strings", "reverent orchestral", "contemplative sacred ambient"],
+        "bpm_range": [45, 75],
+        "volume_default": 0.20,
+        "avoid": ["epic fantasy choir", "electronic", "pop", "drum beat", "Norse or Celtic folk music", "Greek tragedy style"]
+      },
+
+      "subtitle": {
+        "style": "sacred_warm",
+        "fontsize": 30,
+        "fontcolor": "#F0DFA0",
+        "box": true,
+        "boxcolor": "0x140800@0.78",
+        "position": "bottom_center",
+        "line_spacing": 6,
+        "note": "성경드라마 자막 — 어두운 배경에 따뜻한 크림-골드 글씨"
+      },
+
+      "continuity": {
+        "importance": "very_high",
+        "score": 10,
+        "rules": [
+          "성경 본문 내용만 시각화 — 성경에 없는 사건·인물 추가 금지",
+          "성경 시대 고증 일관 — 로마·이집트·유대 시대 복장 혼용 금지",
+          "인물 외모 전 씬 완전 일관 유지",
+          "lighting 톤 일관 — 판타지 조명으로 변질 금지",
+          "story_context.json의 costume_changes 및 location 추적 필수",
+          "첫 씬 PROMPT를 전체 세계관 기준점으로 유지",
+          "기적 묘사 시 과장된 시각 효과 배제 — 인간 반응(표정·눈물·경외)으로 표현"
+        ],
+        "use_story_context": true,
+        "use_first_scene_anchor": true
+      },
+
+      "scene": {
+        "default_duration_sec": 7,
+        "min_duration_sec": 5,
+        "max_duration_sec": 12,
+        "pacing": "slow, human — 인물의 내면 감정을 따라가는 속도",
+        "scene_count_per_min": 3
+      },
+
+      "emotion": {
+        "default_mood": "sacred_human_faith",
+        "keywords": ["믿음", "순종", "고난", "구원", "용서", "헌신", "경외", "은혜"],
+        "color_grade": "warm earth tones — amber, sand, olive — NOT fantasy gold or divine white burst",
+        "arc_type": "faith_tested_and_confirmed"
+      },
+
+      "prompt_rules": {
+        "visual_diversity": false,
+        "scene_independence": false,
+        "presenter_required": false,
+        "cinematic_hints": ["human face showing deep faith, struggle, or gratitude — close-up", "ancient Middle Eastern crowd gathered before a significant moment", "person alone in desert or field — human vulnerability before God", "natural light through stone archway or tent opening", "hands: prayer, labor, receiving bread, lifting child"],
+        "required_in_prompt": ["ancient biblical setting", "historically accurate period costume", "natural warm light (not artificial fantasy glow)", "human emotional expression"],
+        "forbidden_in_prompt": ["modern objects", "smartphones", "현대 건물", "western medieval armor", "fantasy glow effects", "magic particles", "mythological creatures", "wings on humans unless specifically biblical angel context", "Norse visual aesthetic", "Greek temple or Olympus imagery", "wizard or sorcerer appearance", "glowing weapons or shields", "over-exposed divine light burst", "AI fantasy art color palette"]
+      },
+
+      "negative_regex": "고고학|발굴현장|사해문서|역사다큐|성경고고학|판타지|신화|전설|북유럽신화|그리스신화",
+
+      "forbidden_prompt_keywords": ["fantasy", "mythical", "legendary fantasy", "magic", "wizard", "sorcerer", "supernatural fantasy", "Norse", "Olympus", "Greek god", "mythical creature", "dragon", "phoenix", "ethereal particles", "glowing magic", "spell", "enchanted", "mystical realm", "epic fantasy", "dark fantasy", "anime style", "cartoon", "hyper-stylized", "neon glow"],
+
+      "biblical_accuracy_rules": [
+        "모든 장면은 성경 본문(구약·신약)에 명시된 내용만 시각화할 것",
+        "성경에 묘사되지 않은 디테일은 고대 근동 역사·고고학 자료 기반으로만 보완",
+        "천사 묘사: 성경 본문이 외모를 명시한 경우만 해당 묘사 사용, 미명시 시 인간 형태로 표현",
+        "기적 장면: 물리적 결과(홍해가 갈라진 상태)만 묘사, 마법 이펙트 금지",
+        "예수 묘사: 특정 교단 이미지 고정(금발·파란 눈 등) 금지 — 고대 근동 유대인 외모 기준",
+        "지명·인물명 한국어 표기 시 개역개정 성경 표준 표기 사용"
+      ],
+
+      "sacred_tone_rules": [
+        "경건함(reverence)이 드라마틱 과장보다 우선 — 자극보다 묵상",
+        "인물의 신앙 여정과 내면 갈등을 서사의 중심에 배치",
+        "하나님의 존재는 직접 묘사보다 결과·반응·자연 현상으로 간접 표현",
+        "공포·저주·악을 묘사할 때도 선정적 공포 연출 금지",
+        "감동은 스펙터클이 아닌 인간적 진실에서 유래할 것"
+      ]
+    },
+
+    "bible_history": {
+      "code": "bible_history",
+      "label": "성경역사",
+      "label_en": "Bible History",
+      "description": "성경 시대의 역사·고고학·문명을 다큐멘터리 방식으로 서술. 학술적 신뢰감 + 고대 근동 고증 + Sacred Realism. 드라마화 또는 판타지화 금지.",
+      "scriptTone_mapping": ["분석형 (논리적)", "정보 전달형 (명확하고 간결)"],
+      "is_info_content": false,
+      "content_mode": "hybrid",
+
+      "image": {
+        "recommended_style": "Photorealistic documentary, ancient Near East historical accuracy, National Geographic / BBC biblical documentary style",
+        "fallback_style": "Realistic Painting — archaeological illustration style",
+        "style_hint": "historically accurate ancient Near East — sandstone architecture, desert landscape, period-correct artifacts and tools, warm ochre and terracotta earth palette; reenactors in period-accurate costume; no fantasy elements",
+        "forbidden_styles": ["fantasy illustration", "dramatic divine glow beyond documentary realism", "AI fantasy art", "anime or cartoon", "dark fantasy or horror", "mythological visual language (Greek, Norse, etc.)"]
+      },
+
+      "camera": {
+        "primary_shots": ["wide establishing — ancient desert city, ruins, or excavation site", "medium documentary shot — reenactor or scholar in period setting", "close-up — ancient inscription, artifact, coin, or architectural detail", "slow pan — vast biblical landscape (Jordan valley, Sinai desert, Jerusalem hills)"],
+        "avoid": ["dramatic fantasy lighting", "modern color grading", "fast cuts", "over-stylized angles suggesting supernatural"],
+        "movement": "slow, measured documentary pacing — archaeological and historical exploration feel",
+        "prompt_prefix": "historical documentary wide shot, ancient Near East setting, warm desert palette, archaeological accuracy,"
+      },
+
+      "lens": {
+        "type": "standard to wide (28mm–50mm) — documentary clarity",
+        "depth_of_field": "deep focus — ruins and artifacts sharp throughout",
+        "effect": "warm desert haze, natural dust in air, golden-hour desert sunlight, aged documentary film tone — NO fantasy effects",
+        "prompt_fragment": "35mm documentary lens, warm desert haze, sharp historical detail, natural aged film tone, honest documentary lighting"
+      },
+
+      "lighting": {
+        "style": "natural Middle Eastern — harsh noon desert sun, golden hour over ruins, oil lamp interior, torch in ancient structure",
+        "color_temp": "warm ochre (4000K–5500K) — sand, stone, and earth tones",
+        "shadows": "natural hard directional — honest sunlight, not stylized for drama",
+        "prompt_fragment": "harsh natural desert sunlight, warm ochre earth tones, golden-hour ruins glow, honest documentary shadow"
+      },
+
+      "tts": {
+        "voice": "Charon",
+        "speed": "normal",
+        "style_note": "신뢰감 있는 중저음 남성 — 역사 다큐 나레이터, 학술적이고 차분, 경건함 유지",
+        "system_prompt_hint": "Read in a calm, scholarly documentary tone — measured, historically authoritative, BBC or National Geographic biblical documentary style. Respectful but not theatrical"
+      },
+
+      "music": {
+        "mood": "고대 근동의 서정, 역사적 경이, 차분한 학술적 탐구",
+        "keywords": ["ancient middle east ambient", "biblical documentary score", "duduk", "oud", "historical strings", "archaeological documentary music"],
+        "bpm_range": [50, 80],
+        "volume_default": 0.17,
+        "avoid": ["modern pop", "electronic", "epic fantasy choir", "Norse or Celtic folk", "horror ambient"]
+      },
+
+      "subtitle": {
+        "style": "documentary_earth",
+        "fontsize": 29,
+        "fontcolor": "#EAD8B0",
+        "box": true,
+        "boxcolor": "0x160C00@0.74",
+        "position": "bottom_center",
+        "line_spacing": 5,
+        "note": "성경역사 자막 — 모래빛 흙색 크림 텍스트"
+      },
+
+      "continuity": {
+        "importance": "high",
+        "score": 8,
+        "rules": [
+          "고대 근동 시대 고증 엄격 준수 — 이집트·바빌론·이스라엘·아시리아·페르시아·로마 복장·건축 혼용 금지",
+          "지리적 일관성 — 가나안/이집트/메소포타미아 구역 명확히 구분",
+          "아티팩트·건축 양식 시대 일관",
+          "story_context.json era_constraints 활용",
+          "reenactor 의상·외모 전 씬 일관"
+        ],
+        "use_story_context": true,
+        "use_first_scene_anchor": true
+      },
+
+      "scene": {
+        "default_duration_sec": 6,
+        "min_duration_sec": 5,
+        "max_duration_sec": 10,
+        "pacing": "slow-moderate — 역사적 설명에 충분한 호흡",
+        "scene_count_per_min": 4
+      },
+
+      "emotion": {
+        "default_mood": "scholarly_reverence",
+        "keywords": ["역사적 경이", "고고학적 발견", "성경 시대의 무게", "신앙의 역사"],
+        "color_grade": "warm earth documentary — ochre, sand, terracotta, aged parchment",
+        "arc_type": "historical_evidence_to_understanding"
+      },
+
+      "prompt_rules": {
+        "visual_diversity": false,
+        "scene_independence": false,
+        "presenter_required": false,
+        "cinematic_hints": ["ancient ruins with visible natural erosion and age", "period-accurate costume reenactor in historical setting", "close-up of ancient inscription, coin, or artifact", "panoramic desert landscape with ancient city remnants", "excavation site with layered earth strata visible"],
+        "required_in_prompt": ["ancient Near East historical setting", "warm desert earth palette", "historically accurate period detail", "documentary realism tone"],
+        "forbidden_in_prompt": ["fantasy elements", "magic or supernatural glow", "modern objects", "현대 건물", "Norse or Greek mythology visual elements", "mythical creatures", "fantasy armor or weapons", "AI fantasy art style", "over-dramatic divine light", "anime or cartoon style", "wizard or sorcerer", "glowing magic effects"]
+      },
+
+      "negative_regex": "드라마|성경드라마|기적장면|판타지|신화|전설|북유럽|그리스신화|영웅담",
+
+      "forbidden_prompt_keywords": ["fantasy", "mythical", "legendary fantasy", "magic", "wizard", "sorcerer", "supernatural fantasy", "Norse", "Olympus", "Greek god", "mythical creature", "dragon", "phoenix", "glowing magic", "spell", "enchanted", "mystical realm", "epic fantasy", "dark fantasy", "anime style", "cartoon", "hyper-stylized", "neon glow"],
+
+      "biblical_accuracy_rules": [
+        "성경 본문 및 고고학·역사학 문헌 기반으로만 내용 구성",
+        "고고학적으로 미확인된 사실은 '~로 추정된다', '~라는 견해가 있다' 서술 방식 유지",
+        "특정 교단 신학 주장을 사실처럼 제시하지 말 것",
+        "지명·인물명 표기: 한국어는 개역개정 표준, 영어는 NIV/ESV 표준",
+        "고대 근동 문화 맥락 — 이집트·메소포타미아·히브리 문화 구분 엄격히"
+      ],
+
+      "sacred_tone_rules": [
+        "학술적 신뢰감과 종교적 경건함이 공존할 것 — 냉소적 비판이나 과도한 신앙화 모두 금지",
+        "성경 사건의 역사성 탐구를 목적으로 하되, 신앙을 비하하거나 조롱하지 말 것",
+        "다양한 학설이 존재하는 주제는 복수의 관점을 균형 있게 제시",
+        "시청자의 신앙 여부에 관계없이 존중받을 수 있는 서술 유지"
+      ]
+    }
+
+  },
+
+  "defaults": {
+    "fallback_genre": "classic_literature",
+    "auto_detect_rules": {
+      "bible_drama": {
+        "topic_regex": "성경(?!역사|고고학)|성경드라마|예수|모세|아브라함|노아|다윗|솔로몬(?!성전|발굴|고고)|요셉(?!박물관)|삼손|다니엘|에스더|룻|엘리야|엘리사|바울|사도|기적(?!고고|발굴)|홍해|십계명|복음|출애굽|성령|부활(?!역사|고고)",
+        "negative_regex": "고고학|발굴현장|사해문서|역사다큐|판타지|신화|전설|요셉 박물관",
+        "require_topic_match": true,
+        "scriptTone": ["감동 사연형 (공감 위주)"]
+      },
+      "bible_history": {
+        "topic_regex": "성경역사|고대이스라엘|이집트고대|바빌론|앗수르|페르시아제국|성경고고학|사해문서|성경시대|히브리왕국|솔로몬성전|솔로몬 성전|솔로몬발굴|솔로몬고고|성전발굴|출애굽역사|모세역사",
+        "negative_regex": "성경드라마|기적장면|판타지|신화|전설|영웅담",
+        "require_topic_match": true,
+        "scriptTone": ["분析형 (논리적)", "분석형 (논리적)", "역사 다큐형 (사실 중심)"]
+      },
+      "senior_info": {
+        "topic_regex": "시니어|어르신|노인|중년|은퇴|노후|황혼|복지|건강보험|연금|의료비|요양|실버",
+        "scriptTone": ["정보 전달형 (명확하고 간결)"]
+      },
+      "news": {
+        "topic_regex": "뉴스|사건|사고|사회|정치|경제|주가|환율|선거|국회|정부",
+        "scriptTone": ["뉴스형 (객관적)"]
+      },
+      "history": {
+        "topic_regex": "역사|조선|고려|신라|백제|고구려|전쟁|독립운동|임진왜란|병자호란|세종|이순신",
+        "scriptTone": ["분석형 (논리적)"]
+      },
+      "korean_pride": {
+        "topic_regex": "국뽕|대한민국|한국의 힘|K-|BTS|삼성|현대|한국군|특수부대|올림픽|월드컵",
+        "scriptTone": []
+      },
+      "overseas_touching": {
+        "topic_regex": "해외|미국|유럽|일본|교포|이민|외국|감동|실화|사연",
+        "require_topic_match": true,
+        "scriptTone": ["감동 사연형 (공감 위주)"]
+      }
+    }
+  },
+
+  "server_integration": {
+    "note": "아래 키는 server.js meta 객체의 필드명과 1:1 대응",
+    "meta_field": "genre",
+    "usage": {
+      "detectInfoContent": "genres[meta.genre].is_info_content",
+      "ttsVoice": "genres[meta.genre].tts.voice",
+      "ttsSpeed": "genres[meta.genre].tts.speed",
+      "imageStyleHint": "genres[meta.genre].image.style_hint",
+      "cameraPromptPrefix": "genres[meta.genre].camera.prompt_prefix",
+      "lensFragment": "genres[meta.genre].lens.prompt_fragment",
+      "lightingFragment": "genres[meta.genre].lighting.prompt_fragment",
+      "bgmVolume": "genres[meta.genre].music.volume_default",
+      "subtitleFontsize": "genres[meta.genre].subtitle.fontsize",
+      "subtitleBoxcolor": "genres[meta.genre].subtitle.boxcolor",
+      "continuityScore": "genres[meta.genre].continuity.score",
+      "sceneDefaultDuration": "genres[meta.genre].scene.default_duration_sec",
+      "useStoryContext": "genres[meta.genre].continuity.use_story_context",
+      "useFirstSceneAnchor": "genres[meta.genre].continuity.use_first_scene_anchor",
+      "seniorMoodHint": "genres[meta.genre].continuity.senior_mood_hint (optional field)"
+    }
+  }
+}

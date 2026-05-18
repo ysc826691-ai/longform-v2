@@ -1,5 +1,18 @@
 node_modules/
 projects/
+scripts/
 client_secret*.json
 youtube_token.json
+.env
+.env.*
+*.log
+fonts/
+.claude/
+# 임시 분석/초안 파일
+bible_genre_revision.json
+genre_detection_tests.json
+genre_engine_extension_v2.json
+GENRE_ENGINE_REPORT.md
+# Windows 바로가기 및 잔여 파일
+*.lnk
 cd

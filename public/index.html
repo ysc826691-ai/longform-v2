@@ -1017,11 +1017,11 @@ video{width:100%;border-radius:9px;background:#000;max-height:480px;
     <div style="margin-bottom:12px">
       <div style="font-size:12px;color:var(--dim);margin-bottom:7px">잔잔한 무료 음악 사이트 — 들어보고 파일 다운로드 후 업로드하거나 URL을 붙여넣으세요</div>
       <div style="display:flex;flex-wrap:wrap;gap:7px">
-        <a href="https://pixabay.com/music/search/?genre=ambient" target="_blank" style="font-size:12px;padding:5px 12px;border-radius:6px;background:rgba(255,180,0,.15);color:#ffd700;border:1px solid rgba(255,180,0,.35);text-decoration:none;display:inline-flex;align-items:center;gap:5px">🔗 Pixabay Music</a>
+        <a href="https://www.chosic.com/free-music/calm/" target="_blank" style="font-size:12px;padding:5px 12px;border-radius:6px;background:rgba(255,180,0,.15);color:#ffd700;border:1px solid rgba(255,180,0,.35);text-decoration:none;display:inline-flex;align-items:center;gap:5px">🔗 Chosic (잔잔한)</a>
+        <a href="https://freesound.org/search/?q=calm+background&f=type:mp3" target="_blank" style="font-size:12px;padding:5px 12px;border-radius:6px;background:rgba(255,180,0,.15);color:#ffd700;border:1px solid rgba(255,180,0,.35);text-decoration:none;display:inline-flex;align-items:center;gap:5px">🔗 Freesound (CC)</a>
+        <a href="https://incompetech.filmmusic.io/search/?genre=Ambient" target="_blank" style="font-size:12px;padding:5px 12px;border-radius:6px;background:rgba(255,180,0,.15);color:#ffd700;border:1px solid rgba(255,180,0,.35);text-decoration:none;display:inline-flex;align-items:center;gap:5px">🔗 Incompetech</a>
         <a href="https://www.bensound.com/royalty-free-music/track/sweet" target="_blank" style="font-size:12px;padding:5px 12px;border-radius:6px;background:rgba(255,180,0,.15);color:#ffd700;border:1px solid rgba(255,180,0,.35);text-decoration:none;display:inline-flex;align-items:center;gap:5px">🔗 Bensound</a>
         <a href="https://freemusicarchive.org/genre/Ambient/" target="_blank" style="font-size:12px;padding:5px 12px;border-radius:6px;background:rgba(255,180,0,.15);color:#ffd700;border:1px solid rgba(255,180,0,.35);text-decoration:none;display:inline-flex;align-items:center;gap:5px">🔗 Free Music Archive</a>
-        <a href="https://incompetech.filmmusic.io/search/?genre=Ambient" target="_blank" style="font-size:12px;padding:5px 12px;border-radius:6px;background:rgba(255,180,0,.15);color:#ffd700;border:1px solid rgba(255,180,0,.35);text-decoration:none;display:inline-flex;align-items:center;gap:5px">🔗 Incompetech</a>
-        <a href="https://www.chosic.com/free-music/calm/" target="_blank" style="font-size:12px;padding:5px 12px;border-radius:6px;background:rgba(255,180,0,.15);color:#ffd700;border:1px solid rgba(255,180,0,.35);text-decoration:none;display:inline-flex;align-items:center;gap:5px">🔗 Chosic (잔잔한)</a>
       </div>
     </div>
 
@@ -1135,6 +1135,7 @@ video{width:100%;border-radius:9px;background:#000;max-height:480px;
 
   <div class="row-btns">
     <button class="btn btn-main" id="btnRender" onclick="renderFinal()">MP4 렌더 시작</button>
+    <button class="btn btn-dim" id="btnRenderCancel" onclick="cancelRender()" style="margin-left:8px;display:none">⏹ 렌더 취소</button>
     <button class="btn btn-dim" onclick="openSlidePreview()" style="margin-left:8px">🎞 슬라이드쇼 미리보기</button>
   </div>
   <div id="finalResult" class="final-section" style="display:none;margin-top:16px">
@@ -1222,11 +1223,41 @@ video{width:100%;border-radius:9px;background:#000;max-height:480px;
         style="padding:8px 18px;background:none;color:var(--dim);border:none;border-bottom:2px solid transparent;cursor:pointer;font-size:13px">
         ⚡ 시리즈 일괄 생성
       </button>
+      <button id="seriesTab3" onclick="switchSeriesTab(3)"
+        style="padding:8px 18px;background:none;color:var(--dim);border:none;border-bottom:2px solid transparent;cursor:pointer;font-size:13px">
+        👤 인물 관리
+      </button>
     </div>
 
     <!-- 탭1: 목록 -->
     <div id="seriesTabPanel1">
       <div id="seriesModalBody" style="font-size:14px;color:var(--dim);text-align:center;padding:20px">불러오는 중…</div>
+    </div>
+
+    <!-- 탭3: 인물 관리 -->
+    <div id="seriesTabPanel3" style="display:none">
+      <!-- 시리즈명 입력 + 불러오기 -->
+      <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:16px">
+        <div style="flex:1">
+          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:4px">시리즈명</label>
+          <input type="text" id="charRegSeriesName" placeholder="예: 돈키호테 5부작"
+            style="width:100%;box-sizing:border-box;font-size:13px" />
+        </div>
+        <button onclick="loadCharRegistry()"
+          style="padding:8px 16px;border-radius:8px;background:rgba(200,150,255,.2);color:#c896ff;border:1px solid rgba(200,150,255,.4);cursor:pointer;font-size:13px;font-weight:700;white-space:nowrap">
+          불러오기
+        </button>
+        <button onclick="addNewCharCard()"
+          style="padding:8px 16px;border-radius:8px;background:rgba(80,220,120,.15);color:#50dc78;border:1px solid rgba(80,220,120,.4);cursor:pointer;font-size:13px;font-weight:700;white-space:nowrap">
+          + 인물 추가
+        </button>
+      </div>
+      <!-- 인물 카드 목록 -->
+      <div id="charRegistryList">
+        <div style="text-align:center;padding:30px;color:var(--dim);font-size:13px">
+          시리즈명을 입력하고 불러오기를 누르세요.
+        </div>
+      </div>
     </div>
 
     <!-- 탭2: 일괄 생성 -->
@@ -2211,9 +2242,26 @@ function closeSeriesModal() {
 function switchSeriesTab(n) {
   document.getElementById('seriesTabPanel1').style.display = n === 1 ? 'block' : 'none';
   document.getElementById('seriesTabPanel2').style.display = n === 2 ? 'block' : 'none';
-  document.getElementById('seriesTab1').style.cssText += n===1 ? ';color:#c896ff;border-bottom:2px solid #c896ff;background:rgba(200,150,255,.15)' : ';color:var(--dim);border-bottom:2px solid transparent;background:none';
-  document.getElementById('seriesTab2').style.cssText += n===2 ? ';color:#c896ff;border-bottom:2px solid #c896ff;background:rgba(200,150,255,.15)' : ';color:var(--dim);border-bottom:2px solid transparent;background:none';
+  document.getElementById('seriesTabPanel3').style.display = n === 3 ? 'block' : 'none';
+  [1, 2, 3].forEach(i => {
+    const btn = document.getElementById('seriesTab' + i);
+    if (!btn) return;
+    if (i === n) {
+      btn.style.color = '#c896ff';
+      btn.style.borderBottom = '2px solid #c896ff';
+      btn.style.background = 'rgba(200,150,255,.15)';
+    } else {
+      btn.style.color = 'var(--dim)';
+      btn.style.borderBottom = '2px solid transparent';
+      btn.style.background = 'none';
+    }
+  });
   if (n === 1) loadSeriesList();
+  if (n === 3) {
+    // STEP1의 seriesName이 입력돼 있으면 자동 채움
+    const sn = document.getElementById('seriesName')?.value.trim();
+    if (sn) document.getElementById('charRegSeriesName').value = sn;
+  }
 }
 
 const STATUS_LABEL = {
@@ -2294,6 +2342,213 @@ async function loadSeriesList() {
   }
 }
 
+
+// ─── 인물 관리 (character_registry) ─────────────────────────────────────────
+async function loadCharRegistry() {
+  const sn = document.getElementById('charRegSeriesName').value.trim();
+  if (!sn) { alert('시리즈명을 입력하세요.'); return; }
+  const list = document.getElementById('charRegistryList');
+  list.innerHTML = '<div style="text-align:center;padding:20px;color:var(--dim)">불러오는 중…</div>';
+  try {
+    const r = await fetch('/api/series/' + encodeURIComponent(sn) + '/characters');
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    const chars = Object.values(d.characters || {});
+    if (!chars.length) {
+      list.innerHTML = '<div style="text-align:center;padding:24px;color:var(--dim);font-size:13px">' +
+        '등록된 인물이 없습니다.<br><span style="font-size:12px">"+ 인물 추가" 버튼으로 추가하세요.</span></div>';
+      return;
+    }
+    list.innerHTML = '';
+    chars.forEach(c => list.appendChild(buildCharCard(c)));
+  } catch (e) {
+    list.innerHTML = '<div style="color:#ff6666;padding:16px">오류: ' + escHtml(e.message) + '</div>';
+  }
+}
+
+function buildCharCard(c) {
+  const id      = c.id || '';
+  const cardId  = 'charcard_' + id.replace(/[^a-zA-Z0-9]/g, '_');
+  const canonicalPrompt  = c.visual_anchor?.canonical_prompt || '';
+  const clothingDefault  = c.clothing_tracking?.default?.prompt_fragment || '';
+  const ageNote1         = c.age_tracking?.episodes?.['1']?.appearance_note || '';
+
+  const div = document.createElement('div');
+  div.id = cardId;
+  div.style.cssText = 'border:1px solid rgba(200,150,255,.25);border-radius:10px;padding:14px;margin-bottom:12px;background:rgba(200,150,255,.04)';
+  div.innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+      <span style="font-size:15px;font-weight:700;color:#c896ff">👤 ${escHtml(c.name || id)}</span>
+      <span style="font-size:11px;color:var(--dim)">id: ${escHtml(id)}</span>
+      <button onclick="deleteCharacter('${escHtml(id)}', '${escHtml(cardId)}')"
+        style="margin-left:auto;padding:3px 10px;border-radius:6px;background:rgba(255,60,60,.12);color:#ff6b6b;border:1px solid rgba(255,60,60,.3);cursor:pointer;font-size:11px">
+        🗑 삭제
+      </button>
+    </div>
+    <div style="display:grid;gap:10px">
+      <div>
+        <label style="font-size:11px;color:var(--dim);display:block;margin-bottom:3px">이름</label>
+        <input type="text" data-field="name" value="${escHtml(c.name || '')}"
+          style="width:100%;box-sizing:border-box;font-size:12px" />
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--dim);display:block;margin-bottom:3px">
+          Visual Anchor <span style="color:#aaa">(이미지 프롬프트 고정 외모 — 영어)</span>
+        </label>
+        <textarea data-field="canonical_prompt" rows="3"
+          style="width:100%;box-sizing:border-box;font-size:12px;resize:vertical;line-height:1.5"
+          >${escHtml(canonicalPrompt)}</textarea>
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--dim);display:block;margin-bottom:3px">
+          기본 복장 <span style="color:#aaa">(clothing default — 영어)</span>
+        </label>
+        <input type="text" data-field="clothing_default" value="${escHtml(clothingDefault)}"
+          style="width:100%;box-sizing:border-box;font-size:12px" />
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--dim);display:block;margin-bottom:3px">
+          나이 묘사 <span style="color:#aaa">(1화 기준 age note — 영어)</span>
+        </label>
+        <input type="text" data-field="age_note_ep1" value="${escHtml(ageNote1)}"
+          style="width:100%;box-sizing:border-box;font-size:12px" />
+      </div>
+    </div>
+    <div style="margin-top:12px;display:flex;align-items:center;gap:8px">
+      <button onclick="saveCharacter('${escHtml(id)}', '${escHtml(cardId)}')"
+        style="padding:6px 18px;border-radius:8px;background:rgba(200,150,255,.2);color:#c896ff;border:1px solid rgba(200,150,255,.4);cursor:pointer;font-size:13px;font-weight:700">
+        💾 저장
+      </button>
+      <span id="charSaveMsg_${escHtml(cardId)}" style="font-size:12px;color:var(--dim)"></span>
+    </div>`;
+  return div;
+}
+
+async function saveCharacter(charId, cardId) {
+  const sn   = document.getElementById('charRegSeriesName').value.trim();
+  if (!sn) { alert('시리즈명이 없습니다.'); return; }
+  const card = document.getElementById(cardId);
+  if (!card) return;
+
+  const name            = card.querySelector('[data-field="name"]').value.trim();
+  const canonicalPrompt = card.querySelector('[data-field="canonical_prompt"]').value.trim();
+  const clothingDefault = card.querySelector('[data-field="clothing_default"]').value.trim();
+  const ageNote1        = card.querySelector('[data-field="age_note_ep1"]').value.trim();
+
+  const character = {
+    id: charId,
+    name,
+    visual_anchor:    { canonical_prompt: canonicalPrompt },
+    clothing_tracking: { default: { prompt_fragment: clothingDefault } },
+    age_tracking:     { base_age: null, episodes: { '1': { appearance_note: ageNote1 } } },
+  };
+
+  const msgEl = document.getElementById('charSaveMsg_' + cardId);
+  msgEl.textContent = '저장 중…';
+  try {
+    const r = await fetch('/api/series/' + encodeURIComponent(sn) + '/characters', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ character })
+    });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    msgEl.style.color = '#50dc78';
+    msgEl.textContent = '✅ 저장됨';
+    setTimeout(() => { msgEl.textContent = ''; msgEl.style.color = 'var(--dim)'; }, 2000);
+  } catch (e) {
+    msgEl.style.color = '#ff6b6b';
+    msgEl.textContent = '오류: ' + e.message;
+  }
+}
+
+async function deleteCharacter(charId, cardId) {
+  const sn = document.getElementById('charRegSeriesName').value.trim();
+  if (!sn) return;
+  if (!confirm('"' + charId + '" 인물을 삭제하시겠습니까?')) return;
+  try {
+    const r = await fetch('/api/series/' + encodeURIComponent(sn) + '/characters/' + encodeURIComponent(charId), {
+      method: 'DELETE'
+    });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    const card = document.getElementById(cardId);
+    if (card) card.remove();
+    const list = document.getElementById('charRegistryList');
+    if (!list.children.length) {
+      list.innerHTML = '<div style="text-align:center;padding:24px;color:var(--dim);font-size:13px">등록된 인물이 없습니다.</div>';
+    }
+  } catch (e) {
+    alert('삭제 오류: ' + e.message);
+  }
+}
+
+function addNewCharCard() {
+  const sn = document.getElementById('charRegSeriesName').value.trim();
+  if (!sn) { alert('먼저 시리즈명을 입력하고 불러오기를 누르세요.'); return; }
+  const tempId = 'new_' + Date.now();
+  const list = document.getElementById('charRegistryList');
+  // 안내 메시지 제거
+  const empty = list.querySelector('div[style*="text-align:center"]');
+  if (empty) empty.remove();
+  const card = buildCharCard({ id: tempId, name: '', visual_anchor: {}, clothing_tracking: {}, age_tracking: {} });
+  // 새 카드는 id 입력란을 별도 표시
+  const idRow = document.createElement('div');
+  idRow.style.cssText = 'margin-bottom:10px';
+  idRow.innerHTML = `<label style="font-size:11px;color:var(--dim);display:block;margin-bottom:3px">인물 ID <span style="color:#aaa">(영문, 공백 없이 — 예: don_quixote)</span></label>
+    <input type="text" id="newCharId_${tempId}" placeholder="예: hero_main"
+      style="width:100%;box-sizing:border-box;font-size:12px" />`;
+  card.querySelector('.grid, div[style*="display:grid"]')?.prepend(idRow);
+  // 저장 버튼 클릭 시 ID 필드 읽도록 오버라이드
+  const saveBtn = card.querySelector('button[onclick*="saveCharacter"]');
+  if (saveBtn) saveBtn.setAttribute('onclick', `saveNewCharacter('${tempId}', '${card.id}')`);
+  list.prepend(card);
+  card.querySelector('input[data-field="name"]')?.focus();
+}
+
+async function saveNewCharacter(tempId, cardId) {
+  const sn = document.getElementById('charRegSeriesName').value.trim();
+  if (!sn) { alert('시리즈명이 없습니다.'); return; }
+  const card   = document.getElementById(cardId);
+  if (!card) return;
+  const charId = (document.getElementById('newCharId_' + tempId)?.value || '').trim().replace(/\s+/g, '_');
+  if (!charId) { alert('인물 ID를 입력하세요.'); return; }
+
+  const name            = card.querySelector('[data-field="name"]').value.trim();
+  const canonicalPrompt = card.querySelector('[data-field="canonical_prompt"]').value.trim();
+  const clothingDefault = card.querySelector('[data-field="clothing_default"]').value.trim();
+  const ageNote1        = card.querySelector('[data-field="age_note_ep1"]').value.trim();
+
+  const character = {
+    id: charId, name,
+    visual_anchor:     { canonical_prompt: canonicalPrompt },
+    clothing_tracking: { default: { prompt_fragment: clothingDefault } },
+    age_tracking:      { base_age: null, episodes: { '1': { appearance_note: ageNote1 } } },
+  };
+
+  const msgEl = document.getElementById('charSaveMsg_' + cardId);
+  msgEl.textContent = '저장 중…';
+  try {
+    const r = await fetch('/api/series/' + encodeURIComponent(sn) + '/characters', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ character })
+    });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    msgEl.style.color = '#50dc78';
+    msgEl.textContent = '✅ 저장됨';
+    // 임시 카드를 정식 카드로 교체
+    setTimeout(() => {
+      card.remove();
+      const list = document.getElementById('charRegistryList');
+      list.appendChild(buildCharCard(d.character));
+    }, 600);
+  } catch (e) {
+    msgEl.style.color = '#ff6b6b';
+    msgEl.textContent = '오류: ' + e.message;
+  }
+}
 
 function toggleEpMeta(epSafeId) {
   const el = document.getElementById('epMeta_' + epSafeId);
@@ -3309,7 +3564,9 @@ async function generateScenes() {
         sceneCount: Number(document.getElementById('sceneCount').value),
         imageStyle: document.getElementById('imageStyle').value,
         characterDesc: buildFullCharDesc(),
-        characterEthnicity: document.getElementById('characterEthnicity')?.value || ''
+        characterEthnicity: document.getElementById('characterEthnicity')?.value || '',
+        seriesName: document.getElementById('seriesName')?.value.trim() || '',
+        episode:    Number(document.getElementById('seriesEpisode')?.value) || 1
       })
     });
     const d = await r.json();
@@ -4940,8 +5197,10 @@ async function renderFinal() {
     }
   }
 
-  const btn = document.getElementById('btnRender');
+  const btn       = document.getElementById('btnRender');
+  const btnCancel = document.getElementById('btnRenderCancel');
   btn.disabled = true;
+  btnCancel.style.display = 'inline-block';
 
   // 이전 렌더 영상 숨기기
   const finalResult = document.getElementById('finalResult');
@@ -4992,6 +5251,14 @@ async function renderFinal() {
         if (ev.type === 'progress') {
           setProg('pf05','pl05', ev.pct, ev.msg);
           showSt2('st05','info', ev.msg);
+        } else if (ev.type === 'cancelled') {
+          hideProg('prog05');
+          showSt2('st05','info','렌더링이 취소됐습니다.');
+          btn.disabled = false;
+          btnCancel.style.display = 'none';
+          return;
+        } else if (ev.type === 'warning') {
+          showSt2('st05','info', ev.message || '경고');
         } else if (ev.type === 'error') {
           throw new Error(ev.error);
         } else if (ev.type === 'done') {
@@ -5016,6 +5283,19 @@ async function renderFinal() {
     showSt2('st05','err','렌더 오류: ' + e.message);
   }
   btn.disabled = false;
+  btnCancel.style.display = 'none';
+}
+
+async function cancelRender() {
+  if (!projectId) return;
+  const btnCancel = document.getElementById('btnRenderCancel');
+  btnCancel.disabled = true;
+  btnCancel.textContent = '취소 중…';
+  try {
+    await fetch(`/api/render/cancel/${projectId}`, { method: 'POST' });
+  } catch (_) {}
+  btnCancel.disabled = false;
+  btnCancel.textContent = '⏹ 렌더 취소';
 }
 
 // ─── SEO 메타데이터 ────────────────────────────────────────────────────────────
