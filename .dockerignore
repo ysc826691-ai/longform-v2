@@ -1,0 +1,14 @@
+node_modules/
+projects/
+scripts/
+fonts/
+.claude/
+.env
+.env.*
+*.log
+*.lnk
+cd
+bible_genre_revision.json
+genre_detection_tests.json
+genre_engine_extension_v2.json
+GENRE_ENGINE_REPORT.md
