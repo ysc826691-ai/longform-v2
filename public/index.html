@@ -317,7 +317,7 @@ video{width:100%;border-radius:9px;background:#000;max-height:480px;
         <span id="pexelsKeyDot" style="margin-left:auto;width:10px;height:10px;border-radius:50%;background:var(--dim)"></span>
       </div>
       <div style="position:relative">
-        <input type="password" id="pexelsKey" placeholder="키를 입력하세요" oninput="updateKeyDot('pexelsKey','pexelsKeyDot')" style="padding-right:40px" />
+        <input type="password" id="pexelsKey" placeholder="키를 입력하세요" oninput="updateKeyDot('pexelsKey','pexelsKeyDot');autoSaveKey('pexelsKey','lfv2_pexelsKey')" style="padding-right:40px" />
         <button onclick="toggleKeyVis('pexelsKey',this)" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--dim);cursor:pointer;font-size:16px">👁</button>
       </div>
       <div style="font-size:11px;color:var(--dim);margin-top:6px">
@@ -336,7 +336,7 @@ video{width:100%;border-radius:9px;background:#000;max-height:480px;
         <span id="pixabayKeyDot" style="margin-left:auto;width:10px;height:10px;border-radius:50%;background:var(--dim)"></span>
       </div>
       <div style="position:relative">
-        <input type="password" id="pixabayKey" placeholder="키를 입력하세요" oninput="updateKeyDot('pixabayKey','pixabayKeyDot')" style="padding-right:40px" />
+        <input type="password" id="pixabayKey" placeholder="키를 입력하세요" oninput="updateKeyDot('pixabayKey','pixabayKeyDot');autoSaveKey('pixabayKey','lfv2_pixabayKey')" style="padding-right:40px" />
         <button onclick="toggleKeyVis('pixabayKey',this)" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--dim);cursor:pointer;font-size:16px">👁</button>
       </div>
       <div style="font-size:11px;color:var(--dim);margin-top:6px">
@@ -5811,6 +5811,7 @@ function clearKeys() {
   document.getElementById('geminiKey').value  = '';
   document.getElementById('pexelsKey').value  = '';
   document.getElementById('pixabayKey').value = '';
+  refreshKeyDots();
   loadKeyStatus();
 }
 
