@@ -298,7 +298,7 @@ video{width:100%;border-radius:9px;background:#000;max-height:480px;
         <span id="geminiKeyDot" style="margin-left:auto;width:10px;height:10px;border-radius:50%;background:var(--dim)"></span>
       </div>
       <div style="position:relative">
-        <input type="password" id="geminiKey" placeholder="AIzaSy…" oninput="updateKeyDot('geminiKey','geminiKeyDot')" style="padding-right:40px" />
+        <input type="password" id="geminiKey" placeholder="AIzaSy…" oninput="updateKeyDot('geminiKey','geminiKeyDot');autoSaveKey('geminiKey','lfv2_geminiKey')" style="padding-right:40px" />
         <button onclick="toggleKeyVis('geminiKey',this)" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--dim);cursor:pointer;font-size:16px">👁</button>
       </div>
       <div style="font-size:11px;color:var(--dim);margin-top:6px">
@@ -1723,6 +1723,15 @@ function toggleKeyVis(inputId, btn) {
     btn.textContent = '👁';
   }
 }
+// 키 입력 즉시 localStorage 저장 — 새 키 입력 시 구 키 완전 덮어쓰기, 빈 값이면 제거
+function autoSaveKey(inputId, storageKey) {
+  const val = document.getElementById(inputId)?.value?.trim() || '';
+  if (val) {
+    localStorage.setItem(storageKey, val);
+  } else {
+    localStorage.removeItem(storageKey);
+  }
+}
 // 키 입력 여부 표시 (녹색 점)
 function updateKeyDot(inputId, dotId) {
   const val = document.getElementById(inputId)?.value?.trim() || '';
@@ -1756,9 +1765,13 @@ function saveKeys() {
   const geminiKey = document.getElementById('geminiKey').value.trim();
   const pexelsKey = document.getElementById('pexelsKey').value.trim();
   const pixabayKey = document.getElementById('pixabayKey').value.trim();
+  // 값이 있으면 덮어쓰기, 빈 입력이면 구 키 제거 — clearKeys()를 누르기 전까지는 유지
   if (geminiKey)  localStorage.setItem('lfv2_geminiKey',  geminiKey);
+  else            localStorage.removeItem('lfv2_geminiKey');
   if (pexelsKey)  localStorage.setItem('lfv2_pexelsKey',  pexelsKey);
+  else            localStorage.removeItem('lfv2_pexelsKey');
   if (pixabayKey) localStorage.setItem('lfv2_pixabayKey', pixabayKey);
+  else            localStorage.removeItem('lfv2_pixabayKey');
   localStorage.setItem('lfv2_voiceName', document.getElementById('voiceName').value);
 
   // 채널 방향 저장

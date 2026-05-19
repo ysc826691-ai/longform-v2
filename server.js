@@ -92,7 +92,8 @@ const saveNamedScript = (topic, seriesName, episode, script) => {
 };
 
 // Key는 항상 클라이언트 요청에서 받음 — 서버는 저장하지 않음
-const resolveKey = (fromReq) => fromReq || '';
+// Railway GEMINI_API_KEY 환경변수는 브라우저 키가 없을 때만 fallback으로 사용
+const resolveKey = (fromReq) => fromReq || process.env.GEMINI_API_KEY || '';
 
 // 동시 렌더링 제한 (Railway 메모리/CPU 보호)
 let activeRenders = 0;
