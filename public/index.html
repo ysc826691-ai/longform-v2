@@ -275,6 +275,7 @@ video{width:100%;border-radius:9px;background:#000;max-height:480px;
     <button class="btn-reset" style="background:rgba(200,150,255,.12);color:#c896ff;border-color:#c896ff" onclick="openSeriesModal()">📺 시리즈 관리</button>
     <button class="btn-reset" style="background:rgba(1,252,180,.08);color:#01fcb4;border-color:#01fcb4" onclick="location.reload()">↺ 새로고침</button>
     <button class="btn-reset" onclick="resetAll()">⟳ 초기화</button>
+    <button class="btn-reset" id="btnTopClearKeys" style="background:rgba(255,60,60,.12);color:#ff6060;border-color:#ff6060" onclick="clearKeys()">🔑 Key 삭제</button>
   </div>
 </div>
 
@@ -5811,11 +5812,14 @@ function clearKeys() {
   });
   refreshKeyDots();
   loadKeyStatus();
-  const btn = document.getElementById('btnClearKeys');
-  if (btn) {
+  // 하단 버튼 + 상단 버튼 둘 다 피드백
+  ['btnClearKeys','btnTopClearKeys'].forEach(id => {
+    const btn = document.getElementById(id);
+    if (!btn) return;
+    const orig = btn.textContent;
     btn.textContent = '✅ 삭제 완료';
-    setTimeout(() => { btn.textContent = 'Key 전체 삭제'; }, 2000);
-  }
+    setTimeout(() => { btn.textContent = orig; }, 2000);
+  });
 }
 
 function setTopStatus(type, text) {
