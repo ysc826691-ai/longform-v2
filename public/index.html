@@ -5802,31 +5802,20 @@ function resetAll() {
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
-// API Key 전체 삭제 — confirm() 대신 2단계 클릭 방식 (Railway 환경 confirm 차단 대응)
-let _clearKeysArmed = false;
-let _clearKeysTimer = null;
+// API Key 전체 삭제 — 단일 클릭, confirm() 없음 (Railway 환경 차단 대응)
 function clearKeys() {
-  const btn = document.getElementById('btnClearKeys');
-  if (!_clearKeysArmed) {
-    _clearKeysArmed = true;
-    if (btn) { btn.textContent = '⚠️ 한 번 더 클릭하면 삭제'; btn.style.background = '#b00020'; }
-    _clearKeysTimer = setTimeout(() => {
-      _clearKeysArmed = false;
-      if (btn) { btn.textContent = 'Key 전체 삭제'; btn.style.background = ''; }
-    }, 3000);
-    return;
-  }
-  clearTimeout(_clearKeysTimer);
-  _clearKeysArmed = false;
-  localStorage.removeItem('lfv2_geminiKey');
-  localStorage.removeItem('lfv2_pexelsKey');
-  localStorage.removeItem('lfv2_pixabayKey');
-  document.getElementById('geminiKey').value  = '';
-  document.getElementById('pexelsKey').value  = '';
-  document.getElementById('pixabayKey').value = '';
-  if (btn) { btn.textContent = 'Key 전체 삭제'; btn.style.background = ''; }
+  ['lfv2_geminiKey','lfv2_pexelsKey','lfv2_pixabayKey'].forEach(k => localStorage.removeItem(k));
+  ['geminiKey','pexelsKey','pixabayKey'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
   refreshKeyDots();
   loadKeyStatus();
+  const btn = document.getElementById('btnClearKeys');
+  if (btn) {
+    btn.textContent = '✅ 삭제 완료';
+    setTimeout(() => { btn.textContent = 'Key 전체 삭제'; }, 2000);
+  }
 }
 
 function setTopStatus(type, text) {
