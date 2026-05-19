@@ -1691,17 +1691,24 @@ const VOICE_DESC = {
 };
 
 // ─── 초기화 ──────────────────────────────────────────────────────────────────
-window.onload = () => {
-  const keys = ['geminiKey','pexelsKey','pixabayKey','voiceName'];
-  keys.forEach(k => {
+function restoreKeysFromStorage() {
+  ['geminiKey','pexelsKey','pixabayKey'].forEach(k => {
     const v = localStorage.getItem('lfv2_' + k);
-    if (v) document.getElementById(k).value = v;
+    const el = document.getElementById(k);
+    if (el) el.value = v || '';
   });
+  const vn = localStorage.getItem('lfv2_voiceName');
+  const vnEl = document.getElementById('voiceName');
+  if (vn && vnEl) vnEl.value = vn;
+  refreshKeyDots();
+}
+
+window.addEventListener('load', () => {
+  restoreKeysFromStorage();
   showRecentTopics();
   onVoiceChange();
   loadKeyStatus();
-  refreshKeyDots();
-};
+});
 
 function onVoiceChange() {
   const v = document.getElementById('voiceName').value;
