@@ -3367,7 +3367,8 @@ async function generateScript() {
     scoreScript(d.script);
   } catch (e) {
     hideProg('prog02');
-    showSt2('st02','err','오류: ' + e.message);
+    if (isGeminiKeyError(e.message)) showGeminiKeyError('st02');
+    else showSt2('st02','err','오류: ' + e.message);
   }
   btn.disabled = false;
 }
@@ -3603,7 +3604,11 @@ async function generateScenes() {
     showSt2('st03','ok', `장면 ${d.scenes.length}개 생성 완료${charMsg}`);
     document.getElementById('s05').style.display = 'block';
   } catch (e) {
-    showSt2('st03','err','오류: ' + e.message);
+    if (isGeminiKeyError(e.message)) {
+      showGeminiKeyError('st03');
+    } else {
+      showSt2('st03','err','오류: ' + e.message);
+    }
   }
   btn.disabled = false;
 }
@@ -3794,7 +3799,8 @@ async function generateSceneImage(sceneIdx) {
     setSceneImg(sceneIdx, d.path);
     showSt2('st03','ok', `장면 ${sceneIdx} 이미지 생성 완료`);
   } catch (e) {
-    showSt2('st03','err', `장면 ${sceneIdx} 생성 오류: ${e.message}`);
+    if (isGeminiKeyError(e.message)) showGeminiKeyError('st03');
+    else showSt2('st03','err', `장면 ${sceneIdx} 생성 오류: ${e.message}`);
   }
   if (btn) { btn.disabled = false; btn.textContent = 'AI 생성'; }
 }
@@ -4980,7 +4986,8 @@ async function generateTTS() {
     }
   } catch (e) {
     hideProg('prog04');
-    showSt2('st04','err','오류: ' + e.message);
+    if (isGeminiKeyError(e.message)) showGeminiKeyError('st04');
+    else showSt2('st04','err','오류: ' + e.message);
   }
   btn.disabled = false;
 }
@@ -5820,6 +5827,28 @@ function clearKeys() {
     btn.textContent = '✅ 삭제 완료';
     setTimeout(() => { btn.textContent = orig; }, 2000);
   });
+}
+
+function isGeminiKeyError(msg) {
+  if (!msg) return false;
+  const m = msg.toLowerCase();
+  return m.includes('api key') || m.includes('api_key') ||
+    m.includes('invalid') || m.includes('expired') ||
+    m.includes('permission') || m.includes('permission_denied') ||
+    m.includes('quota') || m.includes('resource has been exhausted') ||
+    m.includes('forbidden') || m.includes('unauthorized') ||
+    /\b(400|401|403)\b/.test(m);
+}
+
+function showGeminiKeyError(stId) {
+  const html = `<div style="background:#ff3b3b22;border:1.5px solid #ff3b3b;border-radius:8px;padding:12px 16px;line-height:1.7">
+    <b style="color:#ff3b3b">⚠ Gemini API Key 오류</b><br>
+    <span style="color:var(--text)">Gemini API Key가 잘못되었거나 만료되었습니다.<br>
+    Key 전체 삭제 후 새 Key를 다시 입력해주세요.</span><br>
+    <button onclick="clearKeys()" style="margin-top:8px;padding:5px 14px;background:#ff3b3b;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:700">Key 전체 삭제</button>
+  </div>`;
+  const el = document.getElementById(stId);
+  if (el) { el.innerHTML = html; el.style.display = 'block'; }
 }
 
 function setTopStatus(type, text) {

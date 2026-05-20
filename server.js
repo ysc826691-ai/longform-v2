@@ -421,6 +421,10 @@ async function geminiText({ apiKey, prompt, maxTokens = 8192, temp = 0.8, model 
   const d = await r.json();
   if (!r.ok) {
     const msg = d?.error?.message || `Gemini 오류 (${r.status})`;
+    const isKeyError = r.status === 400 || r.status === 401 || r.status === 403 ||
+      msg.toLowerCase().includes('api key') || msg.toLowerCase().includes('permission') ||
+      msg.toLowerCase().includes('invalid') || (d?.error?.status === 'PERMISSION_DENIED');
+    if (isKeyError) throw new Error(`Gemini API Key 오류 (${r.status}): ${msg}`);
     const isOverload = r.status === 503 || r.status === 429 || r.status === 500 || msg.includes('high demand') || msg.includes('overloaded') || msg.toLowerCase().includes('internal error');
     if (isOverload && _attempt < 4) {
       const wait = [15000, 30000, 60000, 90000][_attempt];
@@ -509,6 +513,10 @@ async function geminiTTS({ apiKey, text, voiceName = 'Aoede', lang = 'ko', _atte
 
   if (!r.ok) {
     const msg = d?.error?.message || `TTS HTTP ${r.status}`;
+    const isKeyError = r.status === 400 || r.status === 401 || r.status === 403 ||
+      msg.toLowerCase().includes('api key') || msg.toLowerCase().includes('permission') ||
+      msg.toLowerCase().includes('invalid') || (d?.error?.status === 'PERMISSION_DENIED');
+    if (isKeyError) throw new Error(`Gemini API Key 오류 (${r.status}): ${msg}`);
     // 429(레이트 리밋) 또는 5xx 서버 오류만 재시도
     if (_attempt < 2 && (r.status === 429 || r.status >= 500)) {
       const wait = r.status === 429 ? 15000 : 8000; // 429는 15초 대기
