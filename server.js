@@ -5604,7 +5604,7 @@ app.use((err, req, res, next) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n롱폼 자동화 v2 — http://localhost:${PORT}\n`);
   // Railway 배포 환경 점검
   if (process.env.RAILWAY_PUBLIC_DOMAIN) {
