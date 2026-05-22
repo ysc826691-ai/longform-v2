@@ -892,7 +892,16 @@ video{width:100%;border-radius:9px;background:#000;max-height:480px;
 
     <!-- ④ 일괄 AI 이미지 생성 -->
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;padding:10px 14px;background:rgba(1,252,1,.05);border:1px solid rgba(1,252,1,.2);border-radius:10px;flex-wrap:wrap">
-      <button class="btn btn-main btn-sm" id="btnBatchGenImages" onclick="batchGenerateImages()">⚡ 전체 AI 이미지 일괄 생성</button>
+      <button class="btn btn-main btn-sm" id="btnBatchGenImages" onclick="batchGenerateImages()">⚡ AI 이미지 일괄 생성</button>
+      <select id="batchImgLimit" style="background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:5px 10px;font-size:13px;font-weight:700">
+        <option value="0">전체</option>
+        <option value="1">테스트 — 1장</option>
+        <option value="3">테스트 — 3장</option>
+        <option value="5">테스트 — 5장</option>
+        <option value="10">10장</option>
+        <option value="15">15장</option>
+        <option value="20">20장</option>
+      </select>
       <button class="btn btn-danger btn-sm" id="btnBatchStop" onclick="stopBatchGenerate()" style="display:none">⏹ 중단</button>
       <span id="batchGenStatus" style="font-size:13px;color:var(--dim)">이미지 없는 장면만 자동 생성. 이미 있는 장면은 건너뜁니다.</span>
       <button class="btn btn-sm" style="margin-left:auto;background:rgba(255,200,0,.2);color:#ffd700;border:1px solid rgba(255,200,0,.5);font-weight:700" onclick="openThumbnailModal()">🎨 썸네일 이미지 생성 / 편집</button>
@@ -6155,6 +6164,8 @@ async function batchGenerateImages() {
     return !b || b.style.display === 'none';
   });
 
+  const batchLimit = parseInt(document.getElementById('batchImgLimit')?.value || '0', 10);
+
   let targets;
   if (noImg.length === 0) {
     if (!confirm(`모든 장면에 이미지가 있습니다.\n전체 ${scenes.length}개를 재생성할까요?`)) return;
@@ -6167,6 +6178,8 @@ async function batchGenerateImages() {
   } else {
     targets = scenes;
   }
+
+  if (batchLimit > 0) targets = targets.slice(0, batchLimit);
 
   _batchStop = false;
   const btn  = document.getElementById('btnBatchGenImages');
