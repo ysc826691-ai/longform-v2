@@ -163,6 +163,211 @@ function srtTime(s) {
   return `${pad2(h)}:${pad2(m)}:${pad2(sc)},${String(ms).padStart(3,'0')}`;
 }
 function pad2(n) { return String(n).padStart(2,'0'); }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TTS segment 실제 duration 기준 SRT 생성
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 구두점 → 쉼표 → 공백/글자수 기준 텍스트 분할. 반환: [{ text, len }]
+function splitAtBoundaries(text) {
+  const sentenceRe = /([^.!?…]+[.!?…]+)/g;
+  const parts = [];
+  let lastIdx = 0, m;
+  while ((m = sentenceRe.exec(text)) !== null) {
+    parts.push(m[0].trim());
+    lastIdx = m.index + m[0].length;
+  }
+  if (lastIdx < text.length) {
+    const tail = text.slice(lastIdx).trim();
+    if (tail) parts.push(tail);
+  }
+  if (!parts.length) parts.push(text);
+
+  const result = [];
+  for (const part of parts) {
+    if (part.length <= 32) {
+      result.push({ text: part, len: part.length });
+      continue;
+    }
+    // 32자 초과 → 쉼표로 재분할
+    const commaParts = part.split(',').map(s => s.trim()).filter(Boolean);
+    if (commaParts.length > 1) {
+      for (const cp of commaParts) {
+        cp.length > 32 ? _splitByChar(cp, result) : result.push({ text: cp, len: cp.length });
+      }
+    } else {
+      _splitByChar(part, result);
+    }
+  }
+  return result.length ? result : [{ text, len: text.length }];
+}
+
+// 공백이 없는 한국어 대비: 30자 단위 강제 분할
+function _splitByChar(text, out) {
+  const words = text.split(' ');
+  if (words.length > 1) {
+    let cur = '';
+    for (const w of words) {
+      const candidate = cur ? cur + ' ' + w : w;
+      if (candidate.length > 30 && cur) { out.push({ text: cur.trim(), len: cur.trim().length }); cur = w; }
+      else { cur = candidate; }
+    }
+    if (cur.trim()) out.push({ text: cur.trim(), len: cur.trim().length });
+  } else {
+    for (let i = 0; i < text.length; i += 30) {
+      const chunk = text.slice(i, i + 30);
+      out.push({ text: chunk, len: chunk.length });
+    }
+  }
+}
+
+// 14~16자 기준 줄 분할, 최대 2줄
+function formatSubtitleLines(text) {
+  if (text.length <= 16) return text;
+  const mid = Math.floor(text.length / 2);
+  let splitIdx = -1;
+  for (let d = 0; d <= mid; d++) {
+    if (mid - d > 0 && /[\s,。、，]/.test(text[mid - d])) { splitIdx = mid - d; break; }
+    if (mid + d < text.length && /[\s,。、，]/.test(text[mid + d])) { splitIdx = mid + d + 1; break; }
+  }
+  if (splitIdx < 0) splitIdx = 16;
+  const line1 = text.slice(0, splitIdx).trim();
+  const line2 = text.slice(splitIdx).trim().slice(0, 32);
+  return line2 ? `${line1}\n${line2}` : line1;
+}
+
+// 메인 함수: TTS segment duration 기준 SRT 생성
+function buildSRTFromTtsSegments(segments, totalDuration) {
+  const cap = totalDuration || Infinity;
+
+  // [1단계] 원시 블록 생성 — segment별 누적 시간 + 글자수 비례 배분
+  const rawBlocks = [];
+  let timeAcc = 0;
+  for (const seg of segments) {
+    if (seg.error) { timeAcc += (seg.duration || 0); continue; }
+    const dur = seg.duration || 0;
+    const text = (seg.fullText || seg.text || '').trim();
+    if (!text || dur <= 0) { timeAcc += dur; continue; }
+
+    const chunks = splitAtBoundaries(text);
+    const totalChars = chunks.reduce((s, c) => s + c.len, 0) || 1;
+    let t = timeAcc;
+    for (const chunk of chunks) {
+      const cd = dur * (chunk.len / totalChars);
+      rawBlocks.push({ text: chunk.text, startTime: t, endTime: t + cd });
+      t += cd;
+    }
+    timeAcc += dur;
+  }
+
+  // 통계 기록 (병합/재분할 전)
+  const shortCount = rawBlocks.filter(b => (b.endTime - b.startTime) < 1.5).length;
+  const longCount  = rawBlocks.filter(b => (b.endTime - b.startTime) >= 5).length;
+
+  // [2단계] 1.5초 미만 블록 → 다음 블록과 병합 (마지막 블록 제외)
+  const merged = [];
+  let i = 0;
+  while (i < rawBlocks.length) {
+    const b = rawBlocks[i];
+    const isLast = i === rawBlocks.length - 1;
+    if ((b.endTime - b.startTime) < 1.5 && !isLast) {
+      const next = rawBlocks[i + 1];
+      merged.push({ text: (b.text + ' ' + next.text).trim(), startTime: b.startTime, endTime: next.endTime });
+      i += 2;
+    } else {
+      merged.push({ ...b });
+      i++;
+    }
+  }
+
+  // [3단계] 5초 이상 블록 → 내부 재분할
+  const afterSplit = [];
+  for (const b of merged) {
+    const bd = b.endTime - b.startTime;
+    if (bd >= 5) {
+      const sub = splitAtBoundaries(b.text);
+      if (sub.length <= 1) { afterSplit.push(b); continue; }
+      const totalChars2 = sub.reduce((s, c) => s + c.len, 0) || 1;
+      let t = b.startTime;
+      for (const chunk of sub) {
+        const cd = bd * (chunk.len / totalChars2);
+        afterSplit.push({ text: chunk.text, startTime: t, endTime: t + cd });
+        t += cd;
+      }
+    } else {
+      afterSplit.push(b);
+    }
+  }
+
+  // [4단계] 2차 병합 패스 — 재분할로 생긴 1.5초 미만 블록 처리
+  // 마지막 블록이 짧으면 이전 블록에 붙임, 그 외는 다음 블록과 병합
+  // 병합 결과가 5초 이상이면 병합하지 않음
+  const final = [];
+  let j = 0;
+  while (j < afterSplit.length) {
+    const b = afterSplit[j];
+    const bd = b.endTime - b.startTime;
+    const isLast = j === afterSplit.length - 1;
+
+    if (bd < 1.5) {
+      if (!isLast) {
+        // 다음 블록과 병합 (5초 이상이 되면 병합 포기)
+        const next = afterSplit[j + 1];
+        const merged2Dur = next.endTime - b.startTime;
+        if (merged2Dur < 5) {
+          final.push({ text: (b.text + ' ' + next.text).trim(), startTime: b.startTime, endTime: next.endTime });
+          j += 2;
+        } else {
+          final.push({ ...b });
+          j++;
+        }
+      } else {
+        // 마지막 블록: 이전 블록에 붙임 (5초 이상이 되면 포기)
+        if (final.length > 0) {
+          const prev = final[final.length - 1];
+          const merged2Dur = b.endTime - prev.startTime;
+          if (merged2Dur < 5) {
+            final[final.length - 1] = { text: (prev.text + ' ' + b.text).trim(), startTime: prev.startTime, endTime: b.endTime };
+          } else {
+            final.push({ ...b });
+          }
+        } else {
+          final.push({ ...b });
+        }
+        j++;
+      }
+    } else {
+      final.push({ ...b });
+      j++;
+    }
+  }
+
+  // [6단계] SRT 출력 + hard cap
+  // ms를 정수 단위로 반올림해 srtTime에서 ms=1000이 나오는 부동소수점 오류 방지
+  const msRound = s => Math.round(s * 1000) / 1000;
+  let out = '';
+  let idx = 1;
+  for (const b of final) {
+    const start = msRound(Math.min(b.startTime, cap));
+    const end   = msRound(Math.min(b.endTime, cap));
+    if (end <= start) continue;
+    const text = b.text.trim();
+    if (!text) continue;
+    out += `${idx++}\n${srtTime(start)} --> ${srtTime(end)}\n${formatSubtitleLines(text)}\n\n`;
+  }
+
+  // [7단계] 통계 로그
+  const lastBlock = final[final.length - 1];
+  const lastTime  = lastBlock ? msRound(Math.min(lastBlock.endTime, cap)) : 0;
+  console.log('[SRT-TTS] segment count     :', segments.length);
+  console.log('[SRT-TTS] totalDuration     :', cap, 's');
+  console.log('[SRT-TTS] SRT last time     :', srtTime(lastTime));
+  console.log('[SRT-TTS] 1.5초 미만 블록 수 (병합 전) :', shortCount);
+  console.log('[SRT-TTS] 5초 이상 블록 수 (재분할 전):', longCount);
+
+  return out;
+}
+
 function ttsChunkSize() {
   return 900; // 약 3분 분량 (한국어 300자/분 기준). 음색 일관성 향상.
 }
@@ -1135,7 +1340,7 @@ ${tmpl}
 - RELATED_KO: SCRIPT_CHUNK에서 핵심 대사 1문장 한국어 원문 그대로
 - RELATED_EN: 위를 자연스러운 영어 구어체로 번역
 - SEARCH: 실제 등장 인물/사물/장소/행동 영어 키워드${visualCharDesc ? ', 인물 외모 키워드 포함' : ''}
-- PROMPT: ⭐ 반드시 이 씬의 SCRIPT_CHUNK에서 묘사하는 실제 장면·행동·인물·배경만 시각화하라. 이 씬 번호의 SCRIPT_CHUNK와 무관한 이미지 절대 금지. 영어 이미지 프롬프트 (인물·행동·배경·조명 순서로 구체적으로)${visualCharDesc ? ', 인물 외모 일치 필수' : ''}. 28번 씬이면 28번 SCRIPT_CHUNK만, 30번 씬이면 30번 SCRIPT_CHUNK만 시각화할 것 — 앞 씬 내용 반복 금지. ⚠ PROMPT에 절대 포함 금지: 따옴표 안 문장, 대사 인용, | 기호 이후 텍스트, text, letters, words, subtitles, captions, watermark, sign, banner, typography, writing, quote — 이미지 안에 어떤 글자도 없어야 함. PROMPT는 순수 시각 묘사만.
+- PROMPT: ⭐ 작성 순서를 반드시 지켜라 → ①RELATED_KO의 핵심 상황(대사가 묘사하는 바로 그 장면을 최우선으로 시각화) ②인물 행동(구체적 동작) ③감정(표정·분위기) ④장소/시간(SCRIPT_CHUNK에 나온 실제 배경) ⑤카메라(샷 타입·앵글) ⑥스타일(조명·색감). SCRIPT_CHUNK와 RELATED_KO에 없는 장면·인물·사물 절대 생성 금지. 이 씬 번호의 SCRIPT_CHUNK만 시각화할 것 — 앞 씬 내용 반복 금지${visualCharDesc ? ', 인물 외모 일치 필수' : ''}. ⚠ PROMPT에 절대 포함 금지: 따옴표 안 문장, 대사 인용, | 기호 이후 텍스트, text, letters, words, subtitles, captions, watermark, sign, banner, typography, writing, quote — PROMPT는 순수 시각 묘사만.
 - PROMPT_KO: 위 PROMPT가 담은 장면 내용을 한국어로 1~2문장 설명 (이미지 프롬프트 해석)
 - CHUNK_EN: SCRIPT_CHUNK 전체를 자연스러운 영어로 번역 (원문 길이 그대로, 요약 금지)
 - [SCENE]과 [/SCENE] 태그는 반드시 유지
@@ -1147,6 +1352,13 @@ ${tmpl}
 - 급격한 배경·인물 단절 금지 — 시청자가 같은 이야기를 보고 있다는 느낌이 유지되어야 함
 ${firstScenePrompt ? `- 1번 씬 PROMPT를 전체 기준으로 삼아 인물·배경의 세계관을 끝까지 일관되게 유지할 것` : ''}
 ${prevScenePrompt ? `- 이전 씬 PROMPT를 참고해 이 배치 첫 번째 씬의 인물·배경을 자연스럽게 연결할 것` : ''}
+
+【구도·포즈 다양화 규칙 — 필수】
+- 연속된 씬에서 카메라 앵글, 샷 타입, 인물 포즈를 반드시 바꿔라
+- 금지: 같은 카메라 위치 연속 2회 이상 (예: 정면 medium shot 두 번 연속 금지)
+- 매 씬마다 다른 샷 타입 사용 (예: close-up → wide shot → over-the-shoulder → low angle → bird's eye 순환)
+- 인물이 같은 씬에 반복 등장해도 자세·방향·동작을 바꿔라 (서있기 → 앉기 → 걷기 → 등 돌리기 등)
+- 배경이 같더라도 카메라 위치나 프레이밍을 달리해서 시각적 변화를 줘라
 
 ${FORBIDDEN_EN}`;
 
@@ -1530,7 +1742,7 @@ app.post('/api/tts/generate', async (req, res) => {
 
   // 롱폼/쇼츠 모두 SRT 항상 생성 (자막 소각·다운로드용)
   try {
-    const srtContent = '﻿' + buildSRT(resultsWithText);
+    const srtContent = '﻿' + buildSRTFromTtsSegments(resultsWithText, totalDuration);
     const srtPath = path.join(audioDir, 'subtitles.srt');
     fs.writeFileSync(srtPath, srtContent, 'utf8');
     console.log('[TTS] SRT 자막 생성 완료:', srtPath);
@@ -1863,27 +2075,38 @@ app.post('/api/media/generate-image', async (req, res) => {
       const converted = await geminiText({
         apiKey: geminiKey,
         prompt: `You are an image generation prompt engineer.
-Convert this Korean script narration into a precise English image generation prompt.
+Your task: convert the Korean dialogue line into a structured English image generation prompt.
 
-Korean script line: "${relatedLine}"
-Supplementary visual description: "${prompt}"
+STEP 1 — DIALOGUE LINE (HIGHEST PRIORITY — must be the primary visual subject):
+"${relatedLine}"
+
+STEP 2 — Supplementary visual context (use only if it adds detail not in the dialogue):
+"${prompt}"
+
 Art style: "${imageStyle || ''}"
 ${charFull ? `
-⚠ CHARACTER APPEARANCE — THIS IS THE HIGHEST PRIORITY RULE:
-The character(s) in the image MUST match this description EXACTLY.
-Do NOT deviate. Do NOT generalize. Copy these details precisely:
+⚠ CHARACTER APPEARANCE — MANDATORY IN EVERY IMAGE:
 "${charFull}"
-Every physical detail (face, hair, clothing, age, body type) must match the above.
+Every physical detail (face, hair, clothing, age, body type) must match exactly. No substitution.
 ` : ''}
 ${culturalContext ? `Cultural context: ${culturalContext}` : ''}
 
+OUTPUT FORMAT — Write the prompt in this exact order, all in one flowing English sentence:
+1. [DIALOGUE CORE SITUATION] — what the dialogue describes happening right now
+2. [CHARACTER ACTION] — what the character is physically doing
+3. [EMOTION] — facial expression and emotional atmosphere
+4. [LOCATION / TIME] — specific place and time of day from the dialogue
+5. [CAMERA] — shot type and angle (e.g. medium shot, low angle, close-up)
+6. [STYLE] — lighting, color grade, cinematic quality
+
 Rules:
-- The image must DIRECTLY illustrate what is described in the Korean narration
-- Include: subjects, action, setting, mood, lighting, camera angle
-${charFull ? '- CHARACTER APPEARANCE IS MANDATORY — reproduce every detail from the description above, do not substitute or approximate' : ''}
-- ⚠ ABSOLUTE BAN: NO TEXT, NO LETTERS, NO WORDS, NO SUBTITLES, NO CAPTIONS, NO WATERMARKS anywhere in the image. Not even blurred, partial, or background text. Pure visual only.
+- The dialogue line DRIVES the image — visualize exactly what the dialogue describes, nothing else
+- DO NOT invent scenes, objects, or characters not present in the dialogue line
+- DO NOT repeat poses or compositions from generic stock imagery
+${charFull ? '- CHARACTER APPEARANCE IS MANDATORY — reproduce every detail precisely' : ''}
+- ⚠ ABSOLUTE BAN: NO TEXT, NO LETTERS, NO WORDS, NO SUBTITLES, NO CAPTIONS, NO WATERMARKS anywhere in the image
 - NEVER use words like "poster", "sign", "banner", "title", "label", "caption", "text" in the prompt
-- Write in English only, max 220 characters
+- Write in English only, max 250 characters
 - Output ONLY the image prompt, nothing else
 - If traditional Korean clothing appears: write "authentic Korean Hanbok" and add "NOT kimono NOT hanfu"
 
@@ -2676,6 +2899,7 @@ app.post('/api/scenes/grok-prompts', async (req, res) => {
   const imageStyle = meta.imageStyle || 'Cinematic realistic photography';
   const charDesc   = meta.characterDesc || '';
   const charNote   = charDesc ? `Main character: ${charDesc}. ` : '';
+  const styleLock  = buildStyleLock(imageStyle);
 
   // Gemini에 보낼 장면 목록 (번호 + 영문 프롬프트 + 한글 대사)
   const sceneList = scenes.map(sc => {
@@ -2687,20 +2911,22 @@ app.post('/api/scenes/grok-prompts', async (req, res) => {
   const sysPrompt = `You are a Grok Aurora AI video prompt specialist.
 Transform each scene's static image description into a Grok video generation prompt.
 
-MANDATORY elements for EVERY Grok prompt (comma-separated):
-1. Core visual scene (from EN_PROMPT, keep essence)
-2. Camera movement (e.g., slow camera pan right, gentle zoom in, slow dolly forward, subtle camera tilt)
-3. Subject/character action (natural subtle movement fitting the scene)
-4. Ambient natural motion (wind, particles, fabric, atmosphere, fire flicker, water ripple — pick what fits)
-5. "5 seconds"
-6. "smooth cinematic motion"
-7. "4K quality"
+${styleLock}
+
+MANDATORY elements for EVERY Grok prompt (comma-separated, in this order):
+1. Source image style tag: "${imageStyle}" — write this first so the generator locks the style
+2. Core visual scene (from EN_PROMPT — image summary, max 1 sentence)
+3. Motion only: what moves and how (character action, ambient motion — no scene redesign)
+4. Camera movement (e.g., slow camera pan right, gentle zoom in, slow dolly forward, subtle camera tilt)
+5. Ambient natural motion (wind, particles, fabric, atmosphere, fire flicker, water ripple — pick what fits the style)
+6. "5 seconds"
+7. "smooth motion"
+8. "4K quality"
 
 Rules:
 - NO text, subtitles, watermarks in prompt
-- Keep each EN prompt under 220 characters
+- Keep each EN prompt under 250 characters
 - Keep each KO prompt under 220 characters (Korean, same meaning)
-- Match the scene's mood and ${imageStyle} style
 - ${charNote}
 
 【SCENE CONTINUITY — MANDATORY from scene 1 to last】
@@ -2845,6 +3071,46 @@ Return ONLY a JSON array, no markdown:
 // Flow Auto Studio — 텍스트 → 비디오 (Veo 3.1) 프롬프트 AI 생성
 // POST /api/scenes/flow-video-prompts-generate
 // ─────────────────────────────────────────────────────────────────────────────
+// ── 스타일 잠금 헬퍼 ─────────────────────────────────────────────────────────
+// imageStyle을 읽어 영상 프롬프트에 삽입할 STYLE LOCK 블록을 반환한다.
+// cinematic realistic photography일 때만 realistic 허용, 나머지는 금지.
+function buildStyleLock(imageStyle) {
+  const s = (imageStyle || '').toLowerCase();
+  const isCinematicRealistic = /cinematic.*realistic|realistic.*photo|live.?action|photorealistic/i.test(imageStyle);
+
+  let stylePreservation;
+  if (/watercolor|pastel/i.test(s))
+    stylePreservation = 'Preserve the watercolor/pastel illustration style — soft painted edges, translucent color washes, paper texture, non-photoreal.';
+  else if (/ghibli/i.test(s))
+    stylePreservation = 'Preserve the Studio Ghibli animation style — hand-drawn look, warm natural palette, soft outlines, 2D cel-shading.';
+  else if (/anime/i.test(s))
+    stylePreservation = 'Preserve the anime illustration style — expressive outlines, cel-shaded flat color, 2D drawn aesthetic.';
+  else if (/line.?art|stick.?figure/i.test(s))
+    stylePreservation = 'Preserve the line-art style — bold clean outlines, minimal flat color, purely 2D drawn look.';
+  else if (/3d render|3d animat/i.test(s))
+    stylePreservation = 'Preserve the 3D rendered style — smooth CGI surfaces, volumetric lighting, computer-generated look.';
+  else if (/cartoon|vector/i.test(s))
+    stylePreservation = 'Preserve the cartoon/vector illustration style — bold outlines, flat graphic colors, 2D animated look.';
+  else if (/oil paint/i.test(s))
+    stylePreservation = 'Preserve the oil painting style — visible textured brushstrokes, rich pigment, painterly finish.';
+  else if (isCinematicRealistic)
+    stylePreservation = 'Preserve the cinematic realistic photography style — photorealistic, film-quality, real-world footage look.';
+  else
+    stylePreservation = `Preserve the exact visual style of the source image: "${imageStyle}" — maintain texture, color palette, line quality, and rendering look.`;
+
+  const bannedStyles = isCinematicRealistic ? '' : `
+BANNED STYLE WORDS — never use any of the following:
+photorealistic, live-action, realistic footage, cinematic realism, documentary footage, 3D realistic render
+Using these would destroy the non-photoreal look of the source image.`;
+
+  return `⚠️ STYLE LOCK — THIS IS THE HIGHEST PRIORITY RULE:
+Animate the existing source image — do NOT redesign, redraw, or change the visual style.
+Source image style: "${imageStyle}"
+${stylePreservation}
+Do NOT convert to photorealistic, cinematic live-action, 3D render, or documentary footage unless the source style is already cinematic realistic photography.
+Preserve the same texture, color palette, lighting, line quality, and non-photoreal look throughout.${bannedStyles}`;
+}
+
 const FLOW_VIDEO_STYLES = {
   cinematic:   'cinematic live-action film, shallow depth of field, dramatic lighting, film grain, widescreen',
   drama:       'emotional drama, warm soft lighting, intimate close-ups, heartfelt atmosphere, gentle color grade',
@@ -2869,9 +3135,12 @@ app.post('/api/scenes/flow-video-prompts-generate', async (req, res) => {
   const scenes = meta.scenes || [];
   if (!scenes.length) return res.status(400).json({ error: '장면 먼저 생성하세요' });
 
-  const styleDesc = FLOW_VIDEO_STYLES[videoStyle] || FLOW_VIDEO_STYLES.cinematic;
-  const charDesc  = meta.characterDesc || '';
-  const charNote  = charDesc ? `Main character: ${charDesc}.` : '';
+  const imageStyle = (meta.imageStyle || 'Cinematic realistic photography')
+    .replace(/,?\s*DO NOT.*$/i, '').trim();
+  const styleLock  = buildStyleLock(imageStyle);
+  const styleDesc  = FLOW_VIDEO_STYLES[videoStyle] || FLOW_VIDEO_STYLES.cinematic;
+  const charDesc   = meta.characterDesc || '';
+  const charNote   = charDesc ? `Main character: ${charDesc}.` : '';
 
   const videoPhysicalTraits = charNote ? (() => {
     const keywords = [
@@ -2893,22 +3162,26 @@ app.post('/api/scenes/flow-video-prompts-generate', async (req, res) => {
 
   const sysPrompt = `You are a Veo 3.1 video prompt specialist for Flow Auto Studio.
 
-Generate a cinematic video prompt for each scene based on the Korean dialogue and image context.
+${styleLock}
 
-STYLE FOR THIS BATCH: ${styleDesc}
+Generate a video prompt for each scene. Animate the existing source image — do not redesign it.
 
-Veo 3.1 prompt structure (comma-separated, natural English):
-1. Subject + setting (faithful to KO_DIALOGUE, specific not generic)
-2. Subject action/motion (subtle natural movement matching the scene mood)
-3. Camera movement (choose one: slow zoom in, gentle pan left/right, slow dolly forward/back, subtle tilt up/down, static shot, handheld slight shake)
-4. Lighting + atmosphere — MUST match the selected style above
-5. Style descriptors from: ${styleDesc}
+SOURCE IMAGE STYLE: "${imageStyle}"
+MOTION STYLE REFERENCE: ${styleDesc}
+
+Veo 3.1 prompt structure (comma-separated, natural English, in this order):
+1. Style tag: "${imageStyle}" — place this first to lock the visual style
+2. Image summary: brief description of the existing image content (from IMAGE_CONTEXT)
+3. Motion only: what moves and how (character action, subtle natural movement — no scene redesign)
+4. Camera movement (choose one: slow zoom in, gentle pan left/right, slow dolly forward/back, subtle tilt up/down, static shot)
+5. Atmosphere motion (ambient light, shadows, particles — must match source image style)
 6. "5 seconds", "no text", "no watermark"
 
 Rules:
 - ${charNote}
+- Animate the existing image — do NOT create a new scene from scratch
 - Every scene must be DISTINCT and SPECIFIC to its dialogue — no generic descriptions
-- Max 250 characters per prompt
+- Max 250 characters per EN prompt
 - Maintain consistent character appearance across all scenes
 - NO "Keep the attached character" type phrases${videoPhysicalTraits}
 
@@ -2959,9 +3232,12 @@ app.post('/api/scenes/flow-asset-video-prompts-generate', async (req, res) => {
   const scenes = meta.scenes || [];
   if (!scenes.length) return res.status(400).json({ error: '장면 먼저 생성하세요' });
 
-  const styleDesc = FLOW_VIDEO_STYLES[videoStyle] || FLOW_VIDEO_STYLES.cinematic;
-  const charDesc  = meta.characterDesc || '';
-  const charNote  = charDesc ? `Main character: ${charDesc}.` : '';
+  const imageStyle = (meta.imageStyle || 'Cinematic realistic photography')
+    .replace(/,?\s*DO NOT.*$/i, '').trim();
+  const styleLock  = buildStyleLock(imageStyle);
+  const styleDesc  = FLOW_VIDEO_STYLES[videoStyle] || FLOW_VIDEO_STYLES.cinematic;
+  const charDesc   = meta.characterDesc || '';
+  const charNote   = charDesc ? `Main character: ${charDesc}.` : '';
 
   const sceneList = scenes.map(sc => {
     const ko  = (sc.relatedLine || sc.scriptChunk || sc.sceneTitle || '').replace(/[\r\n]+/g, ' ').slice(0, 300);
@@ -2971,23 +3247,28 @@ app.post('/api/scenes/flow-asset-video-prompts-generate', async (req, res) => {
 
   const sysPrompt = `You are a Veo 3.1 asset-to-video prompt specialist for Flow Auto Studio.
 
-The user already has a static IMAGE for each scene. Your job is to write a prompt that ANIMATES that existing image.
+${styleLock}
 
-STYLE FOR THIS BATCH: ${styleDesc}
+The user already has a static IMAGE for each scene. Your ONLY job: add motion to that image without changing its visual style.
 
-Asset-to-video prompt structure (comma-separated, natural English):
-1. Brief image description (match EXISTING_IMAGE exactly — same subject, setting, style)
-2. Animation: what moves and how — choose motion that fits the style (${styleDesc})
-3. Camera movement (match the style — dramatic for cinematic, gentle for drama, wide for documentary)
-4. Atmosphere motion (ambient light shift, shadows, depth)
-5. "seamless loop", "5 seconds", "no text", "no watermark"
+SOURCE IMAGE STYLE: "${imageStyle}"
+MOTION REFERENCE: ${styleDesc}
+
+Asset-to-video prompt structure (comma-separated, natural English, in this order):
+1. Style tag: "${imageStyle}" — place this first to lock the visual style
+2. Image summary: brief description of EXISTING_IMAGE (subject, setting, style — must match exactly)
+3. Motion only: what moves and how — subtle, natural motion that fits the source image style
+4. Camera movement (subtle — gentle pan, slow zoom, static hold — match the source image style, NOT action-movie style unless source is cinematic)
+5. Atmosphere motion (ambient light, shadows, depth — must stay within source image visual style)
+6. "seamless loop", "5 seconds", "no text", "no watermark"
 
 Rules:
 - ${charNote}
-- The image content must NOT change — only ADD motion to what already exists
-- Keep movements subtle and natural (not dramatic or unrealistic)
-- Every scene must match its existing image faithfully
-- Max 250 characters per prompt
+- Animate the existing source image — do NOT redesign it or convert it to a different visual style
+- The image content, style, color palette, and texture must NOT change — only ADD motion
+- Keep movements subtle and natural
+- Every scene must match its EXISTING_IMAGE faithfully
+- Max 250 characters per EN prompt
 
 Return ONLY a JSON array, no markdown:
 [{"sceneNumber":1,"en":"...","ko":"..."}, ...]
@@ -4372,41 +4653,19 @@ app.get('/api/project/:id/srt', (req, res) => {
   const srtPath = path.join(pDir(id, 'audio'), 'subtitles.srt');
 
   if (!fs.existsSync(srtPath)) {
-    // SRT가 없으면 meta.json의 ttsSegments로 생성
+    // SRT가 없으면 meta.json의 tts.segments로 재생성
     const mp = pDir(id, 'meta.json');
     if (!fs.existsSync(mp)) return res.status(404).json({ error: 'SRT 파일 없음' });
     try {
       const meta = JSON.parse(fs.readFileSync(mp, 'utf8'));
-      const segs = meta.ttsSegments || [];
+      const segs = (meta.tts && meta.tts.segments) || meta.ttsSegments || [];
       if (!segs.length) return res.status(404).json({ error: 'TTS 세그먼트 없음 — TTS를 먼저 생성하세요' });
-
-      let srt = '';
-      let idx = 1;
-      let timeAcc = 0;
-      for (const seg of segs) {
-        const dur = seg.duration || 3;
-        const start = timeAcc;
-        const end   = timeAcc + dur;
-        const fmt = t => {
-          const h = Math.floor(t / 3600);
-          const m = Math.floor((t % 3600) / 60);
-          const s = Math.floor(t % 60);
-          const ms = Math.round((t % 1) * 1000);
-          return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')},${String(ms).padStart(3,'0')}`;
-        };
-        const text = (seg.text || seg.content || '').trim();
-        if (!text) { timeAcc += dur; continue; }
-        // 20자 단위 줄바꿈
-        const lines = [];
-        for (let i = 0; i < text.length; i += 20) lines.push(text.slice(i, i + 20));
-        srt += `${idx}\n${fmt(start)} --> ${fmt(end)}\n${lines.join('\n')}\n\n`;
-        idx++;
-        timeAcc += dur;
-      }
+      const totalDur = (meta.tts && meta.tts.totalDuration) || 0;
+      const srt = buildSRTFromTtsSegments(segs, totalDur);
       const topic = meta.topic || id;
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(topic)}.srt"`);
-      return res.send(srt);
+      return res.send('﻿' + srt);
     } catch (e) {
       return res.status(500).json({ error: e.message });
     }
