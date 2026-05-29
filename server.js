@@ -12,6 +12,31 @@ const { google } = require('googleapis');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
+// ── 정보성 콘텐츠: 씬별 핵심 기관 정보 추출 ────────────────────────────────────
+function extractInfoOverlay(text) {
+  // 전화번호: "전화번호 1357", "전화번호 1600-5500" 패턴
+  const phoneMatch = text.match(/전화번호\s*([\d][\d\-]+[\d])/);
+  // URL: semas.or.kr, moel.go.kr 등
+  const urlMatch   = text.match(/([\w\-]+\.(?:go|or|com|kr|net)(?:\/[\w./]*)?)/i);
+  // 기관명
+  const agencyRe   = /(소상공인시장진흥공단|고용노동부|중소벤처기업부|국세청|서민금융진흥원|신용회복위원회|중소벤처기업진흥공단|주택도시기금|한국근로복지공단|보건복지부|창업진흥원|국토교통부|LH공사|국민연금공단|고용24|한국에너지공단|행정안전부)/;
+  const agencyMatch = text.match(agencyRe);
+  // 금액: "최대 X억 원", "최대 X천만 원"
+  const amountMatch = text.match(/최대\s*([\d,]+(?:억|천만|만)\s*원)/);
+  // 금리: "연 X%"
+  const rateMatch   = text.match(/연\s*([\d.]+%)/);
+
+  if (!phoneMatch && !urlMatch && !amountMatch && !rateMatch) return null;
+
+  const parts = [];
+  if (agencyMatch)  parts.push(agencyMatch[1]);
+  if (amountMatch)  parts.push(`💰 최대 ${amountMatch[1]}`);
+  if (rateMatch)    parts.push(`📊 연 ${rateMatch[1]}`);
+  if (phoneMatch)   parts.push(`☎ ${phoneMatch[1]}`);
+  if (urlMatch)     parts.push(urlMatch[1]);
+  return parts.join('  |  ');
+}
+
 // ── YouTube OAuth 설정 ────────────────────────────────────────────────────────
 const CLIENT_SECRET_PATH = path.join(__dirname, 'client_secret.json');
 const TOKEN_PATH         = path.join(__dirname, 'youtube_token.json');
@@ -21,6 +46,9 @@ const YOUTUBE_REDIRECT = process.env.RAILWAY_PUBLIC_DOMAIN
   : 'http://localhost:5500/api/youtube/callback';
 
 function getOAuthClient() {
+  if (!fs.existsSync(CLIENT_SECRET_PATH)) {
+    throw new Error('client_secret.json 파일이 없습니다. YouTube 업로드를 사용하려면 Google Cloud Console에서 OAuth 클라이언트 인증 정보를 다운받아 client_secret.json 파일로 저장하세요.');
+  }
   const creds = JSON.parse(fs.readFileSync(CLIENT_SECRET_PATH, 'utf8'));
   const { client_id, client_secret } = creds.installed || creds.web;
   return new google.auth.OAuth2(client_id, client_secret, YOUTUBE_REDIRECT);
@@ -45,11 +73,15 @@ async function getAuthorizedClient() {
 
 const app  = express();
 const PORT = process.env.PORT || 5500;
-const PROJECTS_DIR = path.join(__dirname, 'projects');
-const SCRIPTS_DIR  = path.join(__dirname, 'scripts');
+// Railway Volume: RAILWAY_VOLUME_MOUNT_PATH=/data 설정 시 영속 스토리지 사용
+const DATA_ROOT    = process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
+const PROJECTS_DIR = path.join(DATA_ROOT, 'projects');
+const SCRIPTS_DIR  = path.join(DATA_ROOT, 'scripts');
+const SERIES_DIR   = path.join(DATA_ROOT, 'projects', '_series');
 
 if (!fs.existsSync(PROJECTS_DIR)) fs.mkdirSync(PROJECTS_DIR, { recursive: true });
 if (!fs.existsSync(SCRIPTS_DIR))  fs.mkdirSync(SCRIPTS_DIR,  { recursive: true });
+if (!fs.existsSync(SERIES_DIR))   fs.mkdirSync(SERIES_DIR,   { recursive: true });
 
 const saveNamedScript = (topic, seriesName, episode, script) => {
   const safe = (s) => s.replace(/[\\/:*?"<>|\t\n\r]/g, '_').replace(/\s+/g, ' ').trim();
@@ -60,18 +92,204 @@ const saveNamedScript = (topic, seriesName, episode, script) => {
 };
 
 // Key는 항상 클라이언트 요청에서 받음 — 서버는 저장하지 않음
-const resolveKey = (fromReq) => fromReq || '';
+// Railway GEMINI_API_KEY 환경변수는 브라우저 키가 없을 때만 fallback으로 사용
+const resolveKey = (fromReq) => fromReq || process.env.GEMINI_API_KEY || '';
 
-app.use(cors());
+// 동시 렌더링 제한 (Railway 메모리/CPU 보호)
+let activeRenders = 0;
+const MAX_CONCURRENT_RENDERS = 2;
+
+// 렌더 취소 — projectId → { cmd: ffmpegCommand, cancelled: bool }
+const renderJobs = new Map();
+
+const ALLOWED_ORIGINS = ['http://localhost:5500', 'http://127.0.0.1:5500'];
+if (process.env.RAILWAY_PUBLIC_DOMAIN) ALLOWED_ORIGINS.push(`https://${process.env.RAILWAY_PUBLIC_DOMAIN}`);
+app.use(cors({
+  origin: (origin, cb) => (!origin || ALLOWED_ORIGINS.includes(origin) ? cb(null, true) : cb(new Error('CORS 차단')))
+}));
 app.use(express.json({ limit: '64mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 유틸
 // ─────────────────────────────────────────────────────────────────────────────
+
+// 내부 파일 경로·스택트레이스가 클라이언트에 노출되지 않도록 정제
+function safeErrMsg(err) {
+  const msg = err?.message || String(err);
+  // 윈도우/리눅스 절대경로, 스택트레이스 첫 줄 제거
+  return msg.replace(/([A-Za-z]:[\\/]|\/[\w/.]+\.(js|json|txt))[^\s]*/g, '[경로]').slice(0, 300);
+}
+
 const newId  = () => crypto.randomUUID();
 const pDir   = (id, ...sub) => path.join(PROJECTS_DIR, id, ...sub);
+
+// Path Traversal 방어: 결과 경로가 허용 루트 밖이면 null 반환
+function safeFilePath(base, ...parts) {
+  const resolved = path.resolve(path.join(base, ...parts));
+  return resolved.startsWith(path.resolve(base)) ? resolved : null;
+}
+
 const mkDir  = (p) => { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); };
+// 시리즈 데이터 경로 헬퍼 — seriesName에 한글 포함 가능하므로 encodeURIComponent 적용
+const sDir   = (name, ...sub) => path.join(SERIES_DIR, encodeURIComponent(name), ...sub);
+
+// ── GENRE_ENGINE ────────────────────────────────────────────────────────────
+const GENRE_ENGINE_PATH = path.join(__dirname, 'genre_engine.json');
+const GENRE_ENGINE = fs.existsSync(GENRE_ENGINE_PATH)
+  ? JSON.parse(fs.readFileSync(GENRE_ENGINE_PATH, 'utf8'))
+  : { genres: {}, defaults: { fallback_genre: null, auto_detect_rules: {} } };
+
+function resolveGenre(meta) {
+  // 1) meta.genre 명시값 우선
+  if (meta.genre && GENRE_ENGINE.genres[meta.genre]) return meta.genre;
+  // 2) auto_detect_rules — topic 키워드 + scriptTone 순서로 감지
+  const topic = meta.topic || '';
+  const tone  = meta.scriptTone || '';
+  const rules = GENRE_ENGINE.defaults.auto_detect_rules || {};
+  for (const [code, rule] of Object.entries(rules)) {
+    // negative_regex 매칭 시 이 장르 skip (오분류 방지)
+    if (rule.negative_regex && new RegExp(rule.negative_regex).test(topic)) continue;
+    const topicMatch = rule.topic_regex && new RegExp(rule.topic_regex).test(topic);
+    const toneMatch  = Array.isArray(rule.scriptTone) && rule.scriptTone.includes(tone);
+    // require_topic_match: true 장르는 topic 키워드 일치 필수 (tone 단독 매칭 차단)
+    const hit = rule.require_topic_match ? topicMatch : (topicMatch || toneMatch);
+    if (hit) return code;
+  }
+  // 3) fallback
+  return GENRE_ENGINE.defaults.fallback_genre || null;
+}
+
+function getGenreDef(meta) {
+  const code = resolveGenre(meta);
+  return code ? (GENRE_ENGINE.genres[code] || null) : null;
+}
+
+// 정보성 콘텐츠 감지 — genre_engine 우선, 없으면 기존 규칙 fallback
+const INFO_TOPIC_RE = /지원금|정부\s*지원|복지|세금|보험|연금|의료비?|취업\s*지원|채용|대출|금리|주거급여|장려금|바우처|수당|정책|혜택\s*안내|신청\s*방법/;
+function detectInfoContent(meta) {
+  const def = getGenreDef(meta);
+  if (def) return def.is_info_content === true;
+  return INFO_TOPIC_RE.test(meta.topic || '') ||
+    meta.scriptTone === '정보 전달형 (명확하고 간결)' ||
+    meta.scriptTone === '뉴스형 (객관적)';
+}
+// ── CHARACTER MEMORY SYSTEM ──────────────────────────────────────────────────
+// 시리즈 단위 인물 외형·복장·감정·관계 영구 추적
+// 파일: projects/_series/{seriesName}/character_registry.json
+//       projects/_series/{seriesName}/series_continuity.json
+
+const CHAR_REGISTRY_SCHEMA = {
+  _meta: { version: '1.0', created: '', last_updated_episode: 0 },
+  characters: {},
+  relationships: [],
+};
+
+const SERIES_CONTINUITY_SCHEMA = {
+  _meta: { version: '1.0', created: '' },
+  episodes: {},
+};
+
+function loadCharacterRegistry(seriesName) {
+  if (!seriesName) return JSON.parse(JSON.stringify(CHAR_REGISTRY_SCHEMA));
+  const fp = sDir(seriesName, 'character_registry.json');
+  if (!fs.existsSync(fp)) return JSON.parse(JSON.stringify(CHAR_REGISTRY_SCHEMA));
+  try { return JSON.parse(fs.readFileSync(fp, 'utf8')); }
+  catch (e) { return JSON.parse(JSON.stringify(CHAR_REGISTRY_SCHEMA)); }
+}
+
+function saveCharacterRegistry(seriesName, data) {
+  if (!seriesName) return;
+  mkDir(sDir(seriesName));
+  data._meta = data._meta || {};
+  data._meta.last_updated = new Date().toISOString();
+  fs.writeFileSync(sDir(seriesName, 'character_registry.json'), JSON.stringify(data, null, 2), 'utf8');
+}
+
+function loadSeriesContinuity(seriesName) {
+  if (!seriesName) return JSON.parse(JSON.stringify(SERIES_CONTINUITY_SCHEMA));
+  const fp = sDir(seriesName, 'series_continuity.json');
+  if (!fs.existsSync(fp)) return JSON.parse(JSON.stringify(SERIES_CONTINUITY_SCHEMA));
+  try { return JSON.parse(fs.readFileSync(fp, 'utf8')); }
+  catch (e) { return JSON.parse(JSON.stringify(SERIES_CONTINUITY_SCHEMA)); }
+}
+
+function saveSeriesContinuity(seriesName, data) {
+  if (!seriesName) return;
+  mkDir(sDir(seriesName));
+  data._meta = data._meta || {};
+  data._meta.last_updated = new Date().toISOString();
+  fs.writeFileSync(sDir(seriesName, 'series_continuity.json'), JSON.stringify(data, null, 2), 'utf8');
+}
+
+// 이전 에피소드의 carry_over 데이터 반환 — firstScenePrompt·open_threads·active_characters
+function getSeriesCarryOver(seriesName, episode) {
+  if (!seriesName || Number(episode) <= 1) return null;
+  const cont = loadSeriesContinuity(seriesName);
+  const prevEp = String(Number(episode) - 1);
+  const prev = cont.episodes?.[prevEp];
+  if (!prev) return null;
+  return {
+    last_scene_prompt:          prev.last_scene_prompt          || null,
+    anchor_scene_prompt:        prev.anchor_scene_prompt        || null,
+    character_visual_snapshot:  prev.character_visual_snapshot  || {},
+    open_threads:               prev.open_threads               || [],
+    active_characters:          prev.active_characters          || [],
+    last_location:              prev.last_location              || null,
+    story_time_end:             prev.story_time?.end            || null,
+  };
+}
+
+// 에피소드 완료 시 series_continuity.json에 해당 화 블록 저장
+function saveEpisodeContinuity(seriesName, projectId, episode, data) {
+  if (!seriesName) return;
+  const cont = loadSeriesContinuity(seriesName);
+  if (!cont._meta.created) cont._meta.created = new Date().toISOString();
+  cont.episodes[String(episode)] = {
+    episode_id:                projectId,
+    title:                     data.title                     || '',
+    story_time:                data.story_time                || {},
+    last_location:             data.last_location             || '',
+    last_scene_prompt:         data.last_scene_prompt         || '',
+    anchor_scene_prompt:       data.anchor_scene_prompt       || '',
+    character_visual_snapshot: data.character_visual_snapshot || {},
+    active_characters:         data.active_characters         || [],
+    key_events_completed:      data.key_events_completed      || [],
+    open_threads:              data.open_threads              || [],
+    saved_at:                  new Date().toISOString(),
+  };
+  saveSeriesContinuity(seriesName, cont);
+}
+
+// 현재 에피소드 기준 인물 visual 설명 문자열 생성 (buildPrompt visualCharDesc 용)
+function buildVisualCharDesc(seriesName, episode) {
+  if (!seriesName) return '';
+  const registry = loadCharacterRegistry(seriesName);
+  const chars = Object.values(registry.characters || {});
+  if (!chars.length) return '';
+  const epStr = String(episode || 1);
+  const lines = chars
+    .filter(c => c.visual_anchor?.canonical_prompt)
+    .map(c => {
+      // 에피소드별 clothing override 탐색
+      let clothingFrag = c.clothing_tracking?.default?.prompt_fragment || '';
+      const byCtx = c.clothing_tracking?.by_context || {};
+      for (const [, ctx] of Object.entries(byCtx)) {
+        if (Array.isArray(ctx.active_episodes) && ctx.active_episodes.map(String).includes(epStr)) {
+          clothingFrag = ctx.prompt_fragment || clothingFrag;
+          break;
+        }
+      }
+      // 나이 변화 반영
+      const ageNote = c.age_tracking?.episodes?.[epStr]?.appearance_note || '';
+      const base = c.visual_anchor.canonical_prompt;
+      const extra = [clothingFrag, ageNote].filter(Boolean).join(', ');
+      return `[${c.name}] ${base}${extra ? ' — ' + extra : ''}`;
+    });
+  return lines.join('\n');
+}
+// ── END CHARACTER MEMORY SYSTEM ──────────────────────────────────────────────
+
 const fmtSec = (s) => {
   const m = Math.floor(s / 60), sec = Math.floor(s % 60);
   return `${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
@@ -113,16 +331,27 @@ function normalizeHashtags(t) {
 function splitScript(text, max = 700) {
   const norm = String(text||'').replace(/\r\n/g,'\n').replace(/\r/g,'\n').trim();
   if (!norm) return [];
+
+  // 챕터 마커 줄 제거 (단독으로 TTS 청크가 되면 빈/노이즈 세그먼트 발생)
+  // 예: "**1장.**", "■ 도입부", "【 챕터1 】", "─────" 등
+  const cleanedNorm = norm
+    .replace(/^[\s]*(\*{1,2}[^*\n]{1,30}\*{1,2}|【[^】\n]{1,30}】|■\s*[^\n]{1,30}|[─━=]{3,}.*|#+\s*[^\n]{1,30})[\s]*$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
   // 한국어 포함 — .!?…。\n 기준으로 분할
-  const sentences = norm.match(/[^.!?…。\n]+[.!?…。\n]*/g) || [];
+  const sentences = cleanedNorm.match(/[^.!?…。\n]+[.!?…。\n]*/g) || [];
   const chunks = []; let cur = '';
   for (const s of sentences) {
+    // 공백만 있거나 너무 짧은 조각(10자 미만)은 다음 문장에 붙임
+    if (s.trim().length < 10) { cur = (cur + ' ' + s).trim(); continue; }
     const next = (cur + ' ' + s).trim();
     if (next.length > max && cur) { chunks.push(cur.trim()); cur = s.trim(); }
     else cur = next;
   }
   if (cur.trim()) chunks.push(cur.trim());
-  return chunks;
+  // 10자 미만의 남은 조각은 이전 청크에 병합
+  return chunks.filter(c => c.length >= 10);
 }
 function minChars(len) {
   // 쇼츠 구간 포함
@@ -397,6 +626,10 @@ async function geminiText({ apiKey, prompt, maxTokens = 8192, temp = 0.8, model 
   const d = await r.json();
   if (!r.ok) {
     const msg = d?.error?.message || `Gemini 오류 (${r.status})`;
+    const isKeyError = r.status === 400 || r.status === 401 || r.status === 403 ||
+      msg.toLowerCase().includes('api key') || msg.toLowerCase().includes('permission') ||
+      msg.toLowerCase().includes('invalid') || (d?.error?.status === 'PERMISSION_DENIED');
+    if (isKeyError) throw new Error(`Gemini API Key 오류 (${r.status}): ${msg}`);
     const isOverload = r.status === 503 || r.status === 429 || r.status === 500 || msg.includes('high demand') || msg.includes('overloaded') || msg.toLowerCase().includes('internal error');
     if (isOverload && _attempt < 4) {
       const wait = [15000, 30000, 60000, 90000][_attempt];
@@ -444,9 +677,10 @@ function resolveAtempo(speed) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Gemini TTS 생성 (타임아웃 300초 + 자동 재시도 2회)
 // ─────────────────────────────────────────────────────────────────────────────
-async function geminiTTS({ apiKey, text, voiceName = 'Aoede', lang = 'ko', _attempt = 0 }) {
+async function geminiTTS({ apiKey, text, voiceName = 'Aoede', lang = 'ko', _attempt = 0, prefixOverride = null }) {
   const styles      = VOICE_STYLES[lang] || VOICE_STYLES.ko;
-  const stylePrefix = styles[voiceName] || '';
+  // bible 장르: genre system_prompt_hint 기반 override prefix 우선 적용
+  const stylePrefix = prefixOverride || styles[voiceName] || '';
   const styledText  = stylePrefix + text;
 
   console.log(`[TTS] voice=${voiceName} lang=${lang} attempt=${_attempt + 1} chars=${text.length}`);
@@ -476,7 +710,7 @@ async function geminiTTS({ apiKey, text, voiceName = 'Aoede', lang = 'ko', _atte
       const wait = _attempt === 0 ? 15000 : 30000; // 1차 재시도 15초, 2차 30초 대기
       console.log(`[TTS] 재시도 ${_attempt + 2}/3 — ${wait/1000}초 대기 (사유: ${err.message})`);
       await new Promise(ok => setTimeout(ok, wait));
-      return geminiTTS({ apiKey, text, voiceName, lang, _attempt: _attempt + 1 });
+      return geminiTTS({ apiKey, text, voiceName, lang, _attempt: _attempt + 1, prefixOverride });
     }
     throw new Error(`TTS 타임아웃/네트워크 오류 (3회 실패): ${err.message}`);
   }
@@ -484,12 +718,16 @@ async function geminiTTS({ apiKey, text, voiceName = 'Aoede', lang = 'ko', _atte
 
   if (!r.ok) {
     const msg = d?.error?.message || `TTS HTTP ${r.status}`;
+    const isKeyError = r.status === 400 || r.status === 401 || r.status === 403 ||
+      msg.toLowerCase().includes('api key') || msg.toLowerCase().includes('permission') ||
+      msg.toLowerCase().includes('invalid') || (d?.error?.status === 'PERMISSION_DENIED');
+    if (isKeyError) throw new Error(`Gemini API Key 오류 (${r.status}): ${msg}`);
     // 429(레이트 리밋) 또는 5xx 서버 오류만 재시도
     if (_attempt < 2 && (r.status === 429 || r.status >= 500)) {
       const wait = r.status === 429 ? 15000 : 8000; // 429는 15초 대기
       console.log(`[TTS] 서버 오류 재시도 (${r.status}) — ${wait/1000}초 대기`);
       await new Promise(ok => setTimeout(ok, wait));
-      return geminiTTS({ apiKey, text, voiceName, lang, _attempt: _attempt + 1 });
+      return geminiTTS({ apiKey, text, voiceName, lang, _attempt: _attempt + 1, prefixOverride });
     }
     throw new Error(msg);
   }
@@ -631,7 +869,7 @@ regenerate: total이 21 미만이면 true, 이상이면 false`;
     const result = JSON.parse(clean);
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -685,7 +923,7 @@ ${channelHint} ${styleHint} ${langHint}
     const topics = parseListBlock(raw, '[TOPICS]', '[/TOPICS]').slice(0, 8);
     res.json({ topics });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -759,8 +997,92 @@ REASON: (시청자에게 왜 유용한지 한 줄)
     }).filter(s => s.topic);
     res.json({ suggestions, hasTopic });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CHARACTER MEMORY API
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/series/:name/characters — character_registry 조회
+app.get('/api/series/:name/characters', (req, res) => {
+  const name = decodeURIComponent(req.params.name || '');
+  if (!name) return res.status(400).json({ error: 'seriesName 필요' });
+  res.json(loadCharacterRegistry(name));
+});
+
+// POST /api/series/:name/characters — 인물 등록/업데이트 (upsert)
+// body: { character: { id, name, ... } }
+app.post('/api/series/:name/characters', (req, res) => {
+  const name = decodeURIComponent(req.params.name || '');
+  if (!name) return res.status(400).json({ error: 'seriesName 필요' });
+  const char = req.body.character;
+  if (!char?.id) return res.status(400).json({ error: 'character.id 필요' });
+  const registry = loadCharacterRegistry(name);
+  if (!registry._meta.created) registry._meta.created = new Date().toISOString();
+  registry.characters[char.id] = { ...registry.characters[char.id], ...char };
+  saveCharacterRegistry(name, registry);
+  res.json({ ok: true, character: registry.characters[char.id] });
+});
+
+// GET /api/series/:name/characters/:charId — 단일 인물 조회
+app.get('/api/series/:name/characters/:charId', (req, res) => {
+  const name   = decodeURIComponent(req.params.name || '');
+  const charId = req.params.charId;
+  if (!name || !charId) return res.status(400).json({ error: 'seriesName, charId 필요' });
+  const registry = loadCharacterRegistry(name);
+  const char = registry.characters?.[charId];
+  if (!char) return res.status(404).json({ error: '인물 없음' });
+  res.json(char);
+});
+
+// DELETE /api/series/:name/characters/:charId — 인물 삭제
+app.delete('/api/series/:name/characters/:charId', (req, res) => {
+  const name   = decodeURIComponent(req.params.name || '');
+  const charId = req.params.charId;
+  if (!name || !charId) return res.status(400).json({ error: 'seriesName, charId 필요' });
+  const registry = loadCharacterRegistry(name);
+  if (!registry.characters?.[charId]) return res.status(404).json({ error: '인물 없음' });
+  delete registry.characters[charId];
+  saveCharacterRegistry(name, registry);
+  res.json({ ok: true });
+});
+
+// GET /api/series/:name/continuity — series_continuity 전체 조회
+app.get('/api/series/:name/continuity', (req, res) => {
+  const name = decodeURIComponent(req.params.name || '');
+  if (!name) return res.status(400).json({ error: 'seriesName 필요' });
+  res.json(loadSeriesContinuity(name));
+});
+
+// POST /api/series/:name/continuity/episode — 에피소드 연속성 저장
+// body: { projectId, episode, title, story_time, last_location, last_scene_prompt,
+//         active_characters, key_events_completed, open_threads }
+app.post('/api/series/:name/continuity/episode', (req, res) => {
+  const name = decodeURIComponent(req.params.name || '');
+  if (!name) return res.status(400).json({ error: 'seriesName 필요' });
+  const { projectId, episode, ...data } = req.body;
+  if (!episode) return res.status(400).json({ error: 'episode 필요' });
+  saveEpisodeContinuity(name, projectId || '', Number(episode), data);
+  res.json({ ok: true, episode: Number(episode) });
+});
+
+// GET /api/series/:name/carry-over/:episode — 이전 화 carry_over 반환
+app.get('/api/series/:name/carry-over/:episode', (req, res) => {
+  const name    = decodeURIComponent(req.params.name || '');
+  const episode = Number(req.params.episode);
+  if (!name || !episode) return res.status(400).json({ error: 'seriesName, episode 필요' });
+  const carryOver = getSeriesCarryOver(name, episode);
+  res.json(carryOver);
+});
+
+// GET /api/series/:name/visual-desc/:episode — buildPrompt용 인물 visual 설명 문자열
+app.get('/api/series/:name/visual-desc/:episode', (req, res) => {
+  const name    = decodeURIComponent(req.params.name || '');
+  const episode = Number(req.params.episode) || 1;
+  if (!name) return res.status(400).json({ error: 'seriesName 필요' });
+  res.json({ visualCharDesc: buildVisualCharDesc(name, episode) });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -889,23 +1211,35 @@ STEP 3 (Punch): 마지막 대사 한 줄이 전체 영상의 가치를 결정한
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
 
     // 정보성 톤 여부 (프롬프트 조건 분기에 사용)
-    const isInfoScript = scriptTone === '정보 전달형 (명확하고 간결)' || scriptTone === '뉴스형 (객관적)';
+    // ① 톤이 정보성 ② 특별지침에 정보 관련 키워드 ③ 주제 자체가 정보성 — 셋 중 하나라도 해당하면 정보성 모드
+    const infoKeywordPattern = /신청(방법)?|연락처|인터넷\s*주소|홈페이지|url|구체적|실질적|지원금|복지|세금|보험|전화번호|기관/i;
+    const isInfoScript = scriptTone === '정보 전달형 (명확하고 간결)' || scriptTone === '뉴스형 (객관적)' ||
+      (specialInstructions && infoKeywordPattern.test(specialInstructions)) ||
+      INFO_TOPIC_RE.test(topic);
 
     // 스토리텔링 대본 전용 서사 원칙 블록
+    const _scriptGenreCode = resolveGenre({ topic, scriptTone });
+    const _scriptGenreDef  = _scriptGenreCode ? (GENRE_ENGINE.genres[_scriptGenreCode] || null) : null;
+    const _isBibleGenre    = _scriptGenreCode === 'bible_drama' || _scriptGenreCode === 'bible_history';
+    const _biblicalRules   = _isBibleGenre && Array.isArray(_scriptGenreDef?.biblical_accuracy_rules)
+      ? _scriptGenreDef.biblical_accuracy_rules
+      : [];
+    const _biblicalBlock   = _biblicalRules.length
+      ? `\n【성경 정확성 원칙 — 절대 준수】\n${_biblicalRules.map((r, i) => `${i + 1}. ${r}`).join('\n')}\n`
+      : '';
     const narrativeBlock = !isInfoScript ? `
-【서사 원칙 — 최우선 적용, 아래 모든 규칙보다 우선함】
+【서사 원칙${specialInstructions ? ' — 단, 🔴 사용자 특별 지침이 존재하므로 충돌 시 특별 지침 우선' : ' — 최우선 적용, 아래 모든 규칙보다 우선함'}】
+- 소설·원작 기반 대본은 원작 줄거리와 장면을 정확히 따라가라. 임의로 내용을 만들거나 원작에 없는 해석·사건을 삽입하지 말 것. 원작의 사실이 이 대본의 유일한 근거다.
 - 너는 이야기를 처음 듣는 시청자에게 들려주는 낭독자다. 시청자가 원작을 전혀 모른다고 가정하고 인물·배경·상황을 자연스럽게 소개하며 이야기만 풀어라.
-- 원작 줄거리와 장면을 충실히 따라가라. 임의로 내용을 만들거나 원작에 없는 해석을 삽입하지 말 것.
 - 이야기를 처음부터 끝까지 끊기지 않는 하나의 흐름으로 이어라.
 - 챕터 번호(**1.** **2.** 등) 표시 절대 금지. 숫자 구분 없이 자연스럽게 이어질 것.
-- 현실 통계·정부 기관 정보·전화번호·홈페이지 삽입 절대 금지.
-- "우리 주변에서도", "실제로 많은 분들이", "현대 사회에서도" 등 현대 비교 표현 절대 금지.
+${specialInstructions ? '' : '- 현실 통계·정부 기관 정보·전화번호·홈페이지 삽입 절대 금지.\n'}- "우리 주변에서도", "실제로 많은 분들이", "현대 사회에서도" 등 현대 비교 표현 절대 금지.
 - "이 이야기는 우리에게 ~를 말합니다" 등 직접 교훈·설교 절대 금지. 메시지는 장면과 감정으로만 전달할 것.
 - "아직 제일 중요한 부분이 남았어요", "여기서 반전이 있습니다" 등 메타 표현 절대 금지.
 - 시청자에게 경험을 묻거나 댓글 유도 질문 삽입 절대 금지.
 - 마지막은 이야기의 여운 또는 다음 화에 대한 조용한 기대감으로 끝낼 것.
 - 고유명사 표기 일관성 유지: 에베네저 스크루지, 밥 크래칫, 팀(Tiny Tim), 벨, 제이콥 말리.
-` : '';
+${_biblicalBlock}` : '';
 
     // 채널 방향 지침 블록
     const chDirBlock = channelDirection.trim()
@@ -1012,10 +1346,10 @@ ${FORBIDDEN_KO}
       ? specialInstructions.trim()
       : '';
     const specialBlockKo = specialBlock
-      ? `\n🔴 사용자 특별 지침 (최우선 적용 — 아래 모든 규칙보다 우선):\n${specialBlock}\n`
+      ? `\n🔴 사용자 특별 지침 (절대 최우선 적용 — 서사 원칙·정확성 규칙 포함 아래의 모든 규칙보다 우선. 특별 지침과 다른 규칙이 충돌하면 반드시 특별 지침을 따를 것. 특별 지침의 모든 항목을 빠짐없이 검토하고 대본에 반영할 것):\n${specialBlock}\n`
       : '';
     const specialBlockEn = specialBlock
-      ? `\n🔴 USER SPECIAL INSTRUCTIONS (HIGHEST PRIORITY — override all rules below):\n${specialBlock}\n`
+      ? `\n🔴 USER SPECIAL INSTRUCTIONS (ABSOLUTE HIGHEST PRIORITY — override all rules below including narrative and accuracy rules. Review every item in the special instructions and reflect them fully in the script):\n${specialBlock}\n`
       : '';
 
     const scriptPrompt = isShorts ? shortsPrompt : scriptLang === 'en' ? `
@@ -1148,6 +1482,8 @@ ${FORBIDDEN_KO}
     fs.writeFileSync(pDir(projectId, 'script.txt'), script);
     saveNamedScript(topic, seriesName || '', Number(episode) || 1, script);
     const meta = JSON.parse(fs.readFileSync(pDir(projectId, 'meta.json'), 'utf8'));
+    // genre_engine: topic+scriptTone 기반으로 장르 자동 감지 후 저장
+    const _detectedGenre = resolveGenre({ topic, scriptTone });
     Object.assign(meta, {
       topic, videoLength, scriptTone, chapterCount, scriptLang,
       channelName: chName || '',
@@ -1157,13 +1493,14 @@ ${FORBIDDEN_KO}
       episode: Number(episode) || 1,
       titles, selectedTitle, description, hashtags,
       thumbnailTexts, selectedThumbnail,
-      status: 'script_done'
+      status: 'script_done',
+      ..._detectedGenre ? { genre: _detectedGenre } : {}
     });
     fs.writeFileSync(pDir(projectId, 'meta.json'), JSON.stringify(meta, null, 2));
 
     res.json({ script, titles, selectedTitle, description, hashtags, thumbnailTexts, selectedThumbnail });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -1206,8 +1543,8 @@ app.post('/api/script/save', async (req, res) => {
 // 장면 생성
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/scenes/generate', async (req, res) => {
-  const { projectId, imageStyle = 'Cinematic realistic photography', characterDesc = '' } = req.body;
-  let { sceneCount = 15 } = req.body;
+  const { projectId, imageStyle = 'Cinematic realistic photography', characterDesc = '', characterEthnicity = '' } = req.body;
+  let sceneCount = Math.min(Math.max(Number(req.body.sceneCount) || 15, 1), 50);
   const geminiKey = resolveKey(req.body.geminiKey);
   if (!geminiKey) return res.status(400).json({ error: 'Gemini API Key 필요' });
   if (!projectId) return res.status(400).json({ error: 'projectId 필요' });
@@ -1218,22 +1555,47 @@ app.post('/api/scenes/generate', async (req, res) => {
   const script = fs.readFileSync(scriptPath, 'utf8');
   const meta   = JSON.parse(fs.readFileSync(pDir(projectId, 'meta.json'), 'utf8'));
 
+  const isInfoContent = detectInfoContent(meta);
+
   // 쇼츠 모드: 장면 수 최대 15로 제한 (길이별 유연하게)
   const isShorts = !!meta.isShorts;
   if (isShorts) sceneCount = Math.min(Number(sceneCount) || 5, 15);
 
   // 대본을 sceneCount 등분 → 각 장면이 대본의 특정 구간을 직접 담당
   const scriptNorm = script.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
-  const chunkSize  = Math.ceil(scriptNorm.length / sceneCount);
-  const chunks     = Array.from({ length: sceneCount }, (_, i) =>
-    scriptNorm.slice(i * chunkSize, (i + 1) * chunkSize).trim()
-  );
+
+  // 단락 경계를 존중하는 스마트 분할 (정보성/일반 공통)
+  function splitAtParagraphs(text, count) {
+    const chunkSize = Math.ceil(text.length / count);
+    const result = [];
+    let pos = 0;
+    for (let i = 0; i < count; i++) {
+      if (i === count - 1) { result.push(text.slice(pos).trim()); break; }
+      const ideal = pos + chunkSize;
+      const win = Math.floor(chunkSize * 0.35);
+      const searchStart = Math.max(pos + 1, ideal - win);
+      const searchEnd   = Math.min(text.length - 1, ideal + win);
+      const sub = text.slice(searchStart, searchEnd);
+      const paraBreak = sub.lastIndexOf('\n\n');
+      if (paraBreak >= 0) {
+        const bp = searchStart + paraBreak + 2;
+        result.push(text.slice(pos, bp).trim());
+        pos = bp;
+      } else {
+        result.push(text.slice(pos, ideal).trim());
+        pos = ideal;
+      }
+    }
+    return result;
+  }
+
+  const chunks = splitAtParagraphs(scriptNorm, sceneCount);
 
   const template = chunks.map((chunk, i) => `
 [SCENE]
 NUMBER: ${i}
 [SCRIPT_CHUNK]
-${chunk.slice(0, 400)}
+${chunk.slice(0, 1000)}
 [/SCRIPT_CHUNK]
 TITLE: 장면 제목
 RELATED_KO: 위 SCRIPT_CHUNK에서 핵심 대사 1문장 한국어 원문 그대로
@@ -1273,6 +1635,105 @@ Rules:
     }
   }
 
+  // [S-1] 시리즈: character_registry.json visual_anchor → visualCharDesc 주입/병합
+  const _seriesName = meta.seriesName || '';
+  const _episode    = Number(meta.episode) || 1;
+  if (_seriesName && !isInfoContent) {
+    try {
+      const _registryDesc = buildVisualCharDesc(_seriesName, _episode);
+      if (_registryDesc) {
+        if (!visualCharDesc) {
+          visualCharDesc = _registryDesc;
+          console.log('[Scenes] character_registry visual_anchor 주입');
+        } else {
+          visualCharDesc = _registryDesc + '\n' + visualCharDesc;
+          console.log('[Scenes] character_registry visual_anchor 병합');
+        }
+      }
+    } catch (e) {
+      console.log('[Scenes] character_registry 로드 실패 (스킵):', e.message);
+    }
+  }
+
+  // [S-1b] 씬별 CHARACTER_LOCK 블록 — 각 [SCENE]에 반복 삽입해 외모 드리프트 방지
+  let characterLockBlock = '';
+  if (_seriesName && !isInfoContent) {
+    try {
+      const _lockRegistry = loadCharacterRegistry(_seriesName);
+      const _lockChars = Object.values(_lockRegistry.characters || {});
+      const _epStr = String(_episode);
+      if (_lockChars.length > 0) {
+        const lockLines = _lockChars
+          .filter(c => c.visual_anchor?.canonical_prompt)
+          .map(c => {
+            const base = c.visual_anchor.canonical_prompt;
+            let clothingFrag = c.clothing_tracking?.default?.prompt_fragment || '';
+            const byCtx = c.clothing_tracking?.by_context || {};
+            for (const [, ctx] of Object.entries(byCtx)) {
+              if (Array.isArray(ctx.active_episodes) && ctx.active_episodes.map(String).includes(_epStr)) {
+                clothingFrag = ctx.prompt_fragment || clothingFrag;
+                break;
+              }
+            }
+            const extra = clothingFrag ? ` — ${clothingFrag}` : '';
+            // aliases 필드 지원: "Alonso Quijano" a.k.a. "Don Quixote" 같은 동일 인물 연결
+            const aliasStr = Array.isArray(c.aliases) && c.aliases.length
+              ? ` (a.k.a. ${c.aliases.join(' / ')} — SAME PERSON, SAME FACE)`
+              : '';
+            return `• [${c.name}]${aliasStr} ${base}${extra} ⚠️ SAME ACTOR: same face, same beard, same hairline, same facial proportions — do NOT alter appearance across scenes`;
+          });
+        characterLockBlock = lockLines.join('\n');
+        console.log(`[Scenes] CHARACTER_LOCK 구성: ${_lockChars.length}명`);
+      }
+    } catch (e) {
+      console.log('[Scenes] CHARACTER_LOCK 구성 실패 (스킵):', e.message);
+    }
+  }
+
+  // [S-1c] anchor_keywords 맵 구성 — 씬 생성 후 누락 키워드 자동 보완에 사용
+  // { "Don Quixote": ["gaunt elderly", "silver beard", ...], ... }
+  const anchorKeywordsMap = {};
+  if (_seriesName && !isInfoContent) {
+    try {
+      const _akRegistry = loadCharacterRegistry(_seriesName);
+      for (const c of Object.values(_akRegistry.characters || {})) {
+        const kws = c.visual_anchor?.anchor_keywords;
+        if (Array.isArray(kws) && kws.length > 0) {
+          anchorKeywordsMap[c.name] = kws.map(k => k.toLowerCase().trim());
+        }
+      }
+      const total = Object.values(anchorKeywordsMap).reduce((n, arr) => n + arr.length, 0);
+      if (total > 0) console.log(`[Scenes] anchor_keywords 로드: ${total}개 키워드 (${Object.keys(anchorKeywordsMap).join(', ')})`);
+    } catch (e) {
+      console.log('[Scenes] anchor_keywords 로드 실패 (스킵):', e.message);
+    }
+  }
+
+  // [S-1c] enforceAnchorKeywords() — 생성된 scene.prompt에서 anchor_keywords 누락 시 끝에 append
+  const enforceAnchorKeywords = (sceneList) => {
+    if (!Object.keys(anchorKeywordsMap).length) return sceneList;
+    let fixCount = 0;
+    for (const sc of sceneList) {
+      if (!sc.prompt) continue;
+      const promptLower = sc.prompt.toLowerCase();
+      const missing = [];
+      for (const [charName, kws] of Object.entries(anchorKeywordsMap)) {
+        // 이 씬 prompt에 캐릭터 이름(또는 일부)이 있을 때만 키워드 체크
+        const nameTokens = charName.toLowerCase().split(/\s+/);
+        const charMentioned = nameTokens.some(tok => tok.length >= 3 && promptLower.includes(tok));
+        if (!charMentioned) continue;
+        const missingKws = kws.filter(kw => !promptLower.includes(kw));
+        if (missingKws.length > 0) missing.push(...missingKws);
+      }
+      if (missing.length > 0) {
+        sc.prompt = `${sc.prompt}, ${missing.join(', ')}`;
+        fixCount++;
+      }
+    }
+    if (fixCount > 0) console.log(`[Scenes] anchor_keywords 보완: ${fixCount}개 씬`);
+    return sceneList;
+  };
+
   // 신체 특성(장애/상처) 감지 — 대본에 언급 없어도 모든 씬에 강제 적용
   const physicalRules = visualCharDesc ? (() => {
     const checks = [
@@ -1299,8 +1760,8 @@ ${tmpl}
 - RELATED_KO: 해당 SCRIPT_CHUNK의 핵심 대사 1문장을 한국어 원문 그대로 인용
 - RELATED_EN: RELATED_KO를 자연스러운 영어 구어체로 번역 (1문장)
 - SEARCH: SCRIPT_CHUNK에 등장하는 실제 인물/사물/장소/행동을 영어로 (스타일 단어 절대 금지)${visualCharDesc ? '. 인물이 등장하면 외모 키워드 반드시 포함' : ''}
-- PROMPT: SCRIPT_CHUNK 장면을 구체적으로 묘사하는 영어 이미지 프롬프트 (이미지 스타일 포함, 인물·행동·배경·감정·조명 포함)${visualCharDesc ? '. 인물은 반드시 등장인물 외모와 일치하게 묘사' : ''}
-- PROMPT 작성 시 절대 금지: 간판·현수막·포스터·문서·화면·인포그래픽·차트·숫자·전화번호·URL·기관명 등 텍스트가 포함될 수 있는 오브젝트 묘사 금지. 대신 인물·표정·행동·자연·배경·감정으로 시각화할 것
+- PROMPT: SCRIPT_CHUNK 장면을 구체적으로 묘사하는 영어 이미지 프롬프트 (이미지 스타일 포함, ${isInfoContent ? '내용·상황·환경 중심으로 시각화. 설명하는 사람 위주 금지 — 대신 그 정보가 실제로 적용되는 장면을 보여줄 것. 예) 소상공인 지원이면 활기찬 가게 내부, 취업지원이면 직업훈련 현장, 복지수당이면 가족이 안도하는 생활 공간, 정부지원이면 서류를 처리하는 손과 사무 환경' : '인물·행동·배경·감정·조명 포함'}${visualCharDesc ? '. 인물은 반드시 등장인물 외모와 일치하게 묘사' : ''})
+- PROMPT 작성 시 절대 금지: 간판·현수막·포스터·문서·화면·인포그래픽·차트·숫자·전화번호·URL·기관명 등 텍스트가 포함될 수 있는 오브젝트 묘사 금지. ${isInfoContent ? '대신 상황·공간·사람들의 표정·행동으로 정보의 실질적 의미를 시각화할 것' : '대신 인물·표정·행동·자연·배경·감정으로 시각화할 것'}
 - 반드시 ${sceneCount}개 [SCENE]...[/SCENE] 블록을 모두 완성하라. 절대 생략하지 마라.
 
 ${FORBIDDEN_EN}`;
@@ -1308,27 +1769,110 @@ ${FORBIDDEN_EN}`;
   // 배치 크기: 한 번에 최대 8장면 (포맷 유지 안정성)
   const BATCH = 5; // 5장씩 배치 (8→5로 줄여 누락 방지)
 
+  // 정보성 콘텐츠 사전 분석 결과 (pre-analysis pass에서 채워짐)
+  let sceneVisualHints = [];
+  let infoPresenterDesc = ''; // 진행자 외모 — pre-analysis에서 추출, 모든 씬에 일관 적용
+
   const shortsStyleHint = isShorts ? ', vertical portrait 9:16 framing, centered subject, close-up or medium shot, bold composition' : '';
+
+  // GENRE_ENGINE 기반 스타일 힌트 — 장르 감지 → 카메라·렌즈·조명 프래그먼트 주입
+  const _genreDef = getGenreDef(meta);
+  const genreCode = resolveGenre(meta);
+  const genreCameraPrefix  = _genreDef?.camera?.prompt_prefix  ? `, ${_genreDef.camera.prompt_prefix}`   : '';
+  const genreLensFragment  = _genreDef?.lens?.prompt_fragment   ? `, ${_genreDef.lens.prompt_fragment}`   : '';
+  const genreLightFragment = _genreDef?.lighting?.prompt_fragment ? `, ${_genreDef.lighting.prompt_fragment}` : '';
+  const genreStyleHint = `${genreCameraPrefix}${genreLensFragment}${genreLightFragment}`;
+
+  // 성경 장르: forbidden_prompt_keywords → buildPrompt 내 금지어 블록
+  const _forbiddenKws = (genreCode === 'bible_drama' || genreCode === 'bible_history')
+    && Array.isArray(_genreDef?.forbidden_prompt_keywords)
+    ? _genreDef.forbidden_prompt_keywords
+    : [];
+  const genreForbiddenBlock = _forbiddenKws.length
+    ? `\n⛔ SACRED REALISM — STRICTLY FORBIDDEN in PROMPT (Bible genre): ${_forbiddenKws.join(', ')} — never use these words or concepts in any image prompt.\n`
+    : '';
+
+  // 시니어 감성 힌트 — genre senior_info의 senior_mood_hint 우선, fallback은 기존 regex
+  const isSeniorTone = genreCode === 'senior_info' ||
+    /시니어|어르신|노인|중년|중장년|은퇴|인생|추억|그리움|가족|손자|손녀|부모님|노후|황혼|소회|회고|감사|위로|치유|힐링/.test(meta.topic || '');
+  const seniorStyleHint = isSeniorTone
+    ? (_genreDef?.continuity?.senior_mood_hint
+        ? `, ${_genreDef.continuity.senior_mood_hint}`
+        : ', warm golden-hour lighting, soft focus, gentle color palette, emotionally resonant composition')
+    : '';
+
   const makeBatchTemplate = (batchChunks) =>
-    batchChunks.map(({ idx, chunk }) => `
+    batchChunks.map(({ idx, chunk }) => {
+      const hint = isInfoContent ? sceneVisualHints.find(h => Number(h.num) === idx) : null;
+      const hintLine = hint ? `\nVISUAL_HINT: ${hint.visual}` : '';
+      const presenterLine = (isInfoContent && infoPresenterDesc) ? `\nPRESENTER_CONSISTENCY: 진행자가 이 씬에 등장하는 경우 반드시 이 외모 유지 — ${infoPresenterDesc}` : '';
+      const charLockLine = characterLockBlock ? `\nCHARACTER_LOCK (이 씬 PROMPT에 등장인물이 있으면 아래 외모를 그대로 재현할 것 — 변형 절대 금지):\n${characterLockBlock}` : '';
+      return `
 [SCENE]
 NUMBER: ${idx}
-SCRIPT_CHUNK: ${chunk.slice(0, 350)}
+SCRIPT_CHUNK: ${chunk.slice(0, 1000)}${hintLine}${presenterLine}${charLockLine}
 TITLE: (장면 제목)
 RELATED_KO: (위 SCRIPT_CHUNK 핵심 대사 1문장 한국어 원문)
 RELATED_EN: (English translation, natural spoken)
-MOOD: (분위기)
+MOOD: (분위기 — 예: tense, warm, melancholic, hopeful, joyful, nostalgic)
 SEARCH: (3-5 English keywords, NO style words)
-PROMPT: (image prompt in English, include style: ${imageStyle}${shortsStyleHint})
+PROMPT: (image prompt in English, include style: ${imageStyle}${shortsStyleHint}${seniorStyleHint}${genreStyleHint})
 PROMPT_KO: (위 PROMPT가 담은 장면 내용을 한국어로 1~2문장 설명)
 CHUNK_EN: (SCRIPT_CHUNK 전체를 자연스러운 영어로 번역, 원문 길이 유지)
-[/SCENE]`).join('\n');
+[/SCENE]`;
+    }).join('\n');
 
-  const buildPrompt = (tmpl, prevScenePrompt = '', firstScenePrompt = '') =>
-`주제: ${meta.topic}
+  const buildPrompt = (tmpl, prevScenePrompt = '', firstScenePrompt = '', batchStart = 1, batchEnd = sceneCount) => {
+  // 소설/드라마 전용: 스토리 컨텍스트 블록 생성
+  let storyCtxBlock = '';
+  if (!isInfoContent && storyContext) {
+    const parts = [];
+    if (storyContext.characters?.length > 0) {
+      const charLines = storyContext.characters.map(c => {
+        const costume = [...(c.costume_changes || [])].reverse().find(ch => ch.from_scene <= batchStart);
+        const appearance = costume ? `${c.appearance} / 현재 의상: ${costume.desc}` : c.appearance;
+        return `  ${c.name}: ${appearance}`;
+      }).join('\n');
+      parts.push(`👤 등장인물 외모 (씬 ${batchStart} 기준):\n${charLines}`);
+    }
+    const loc = storyContext.locations?.find(l => l.scene_range[0] <= batchStart && l.scene_range[1] >= batchStart);
+    if (loc) parts.push(`📍 현재 장소: ${loc.name} — ${loc.visual}`);
+    const emo = storyContext.emotional_arc?.find(e => e.scene_range[0] <= batchStart && e.scene_range[1] >= batchStart);
+    if (emo) parts.push(`💭 감정 흐름: ${emo.state} (${emo.note})`);
+    const beats = (storyContext.story_beats || []).filter(b => b.scene >= batchStart && b.scene <= batchEnd);
+    if (beats.length > 0) parts.push(`⚡ 이 구간 전환점: ${beats.map(b => `씬${b.scene} — ${b.event}`).join(' / ')}`);
+    if (storyContext.continuity_rules?.length > 0) parts.push(`🔒 연속성 규칙: ${storyContext.continuity_rules.join(' / ')}`);
+    if (parts.length > 0) storyCtxBlock = `\n📖 스토리 컨텍스트 (씬 ${batchStart}~${batchEnd}):\n${parts.join('\n')}\n`;
+  }
+  // [S-2] 시리즈 2화 이상: 이전 화 carry_over → 에피소드 간 연속성 블록
+  let _carryOverBlock = '';
+  if (_seriesName && _episode > 1) {
+    const _co = getSeriesCarryOver(_seriesName, _episode);
+    if (_co) {
+      const _coParts = [];
+      if (_co.anchor_scene_prompt)
+        _coParts.push(`🎬 이전 화 1번 씬 PROMPT (인물·세계관 기준점): ${_co.anchor_scene_prompt.slice(0, 400)}`);
+      else if (_co.last_scene_prompt)
+        _coParts.push(`🎬 이전 화 마지막 장면 PROMPT: ${_co.last_scene_prompt.slice(0, 300)}`);
+      if (_co.last_location)
+        _coParts.push(`📍 이전 화 마지막 장소: ${_co.last_location}`);
+      // character_visual_snapshot — 실제 생성된 외형 기준점
+      const _snap = _co.character_visual_snapshot || {};
+      if (Object.keys(_snap).length > 0) {
+        const _snapLines = Object.entries(_snap).map(([name, s]) =>
+          `  [${name}] ${s.confirmed_prompt} (${s.episode}화 씬${s.scene_confirmed} 기준)`
+        ).join('\n');
+        _coParts.push(`👤 이전 화 확인된 인물 외형 (이번 화에도 동일하게 유지할 것):\n${_snapLines}`);
+      }
+      if (_co.open_threads?.length)
+        _coParts.push(`🔗 이어지는 스토리 실마리: ${_co.open_threads.join(' / ')}`);
+      if (_coParts.length) _carryOverBlock = `\n📺 에피소드 간 연속성 (${_episode - 1}화→${_episode}화):\n${_coParts.join('\n')}\n`;
+    }
+  }
+  return `주제: ${meta.topic}
 이미지 스타일: ${imageStyle}
 ${visualCharDesc ? `등장인물 외모 (일관성 필수): ${visualCharDesc}` : ''}
-${physicalRules ? `\n${physicalRules}\n` : ''}${firstScenePrompt ? `🎬 1번 씬 PROMPT (전체 기준점 — 끝까지 인물·배경 일관성 유지): ${firstScenePrompt}` : ''}
+${physicalRules ? `\n${physicalRules}\n` : ''}${storyCtxBlock}${_carryOverBlock}${firstScenePrompt ? `🎬 1번 씬 PROMPT (전체 기준점 — 끝까지 인물·배경 일관성 유지): ${firstScenePrompt}` : ''}
 ${prevScenePrompt ? `⬆ 바로 이전 씬 PROMPT (직전 연속성 참고): ${prevScenePrompt}` : ''}
 
 아래 각 [SCENE] 블록의 SCRIPT_CHUNK를 읽고 빈 칸을 채워라.
@@ -1340,16 +1884,27 @@ ${tmpl}
 - RELATED_KO: SCRIPT_CHUNK에서 핵심 대사 1문장 한국어 원문 그대로
 - RELATED_EN: 위를 자연스러운 영어 구어체로 번역
 - SEARCH: 실제 등장 인물/사물/장소/행동 영어 키워드${visualCharDesc ? ', 인물 외모 키워드 포함' : ''}
-- PROMPT: ⭐ 작성 순서를 반드시 지켜라 → ①RELATED_KO의 핵심 상황(대사가 묘사하는 바로 그 장면을 최우선으로 시각화) ②인물 행동(구체적 동작) ③감정(표정·분위기) ④장소/시간(SCRIPT_CHUNK에 나온 실제 배경) ⑤카메라(샷 타입·앵글) ⑥스타일(조명·색감). SCRIPT_CHUNK와 RELATED_KO에 없는 장면·인물·사물 절대 생성 금지. 이 씬 번호의 SCRIPT_CHUNK만 시각화할 것 — 앞 씬 내용 반복 금지${visualCharDesc ? ', 인물 외모 일치 필수' : ''}. ⚠ PROMPT에 절대 포함 금지: 따옴표 안 문장, 대사 인용, | 기호 이후 텍스트, text, letters, words, subtitles, captions, watermark, sign, banner, typography, writing, quote — PROMPT는 순수 시각 묘사만.
+- PROMPT: ⭐ 반드시 이 씬의 SCRIPT_CHUNK 핵심 포인트를 시각화하라. SCRIPT_CHUNK와 무관한 이미지 절대 금지.${isInfoContent ? ` 【정보성 콘텐츠 필수 규칙】VISUAL_HINT가 있으면 그 방향을 최우선으로 활용해 PROMPT를 구성하라. 이 씬이 전달하는 핵심 정보(지원제도·혜택·상황)가 실제로 펼쳐지는 생생한 장면을 보여줄 것. 설명자(나레이터) 단독 등장 금지 — 반드시 그 정보가 실제 삶에 적용되는 장면과 함께 묘사. 예시: 주거지원→가족이 밝은 새집에 짐 푸는 장면, 학자금대출→도서관서 집중하는 대학생, 소상공인바우처→활기찬 가게 안 사장님 표정, K-패스→대중교통 타며 카드 찍는 손, 취업지원→악수하는 청년과 면접관, 긴급복지→안도하는 가족의 식탁. 영어 이미지 프롬프트 (장면·공간·인물행동·표정·조명 순서로 구체적으로)` : ` 영어 이미지 프롬프트 — 아래 요소를 순서대로 포함할 것: ①인물(외모·표정·감정·눈빛·몸짓) ②행동(구체적 동작) ③배경(장소·환경·시간대) ④조명(golden hour / soft diffused / dramatic rim light 등 명시) ⑤카메라(medium shot / close-up / wide establishing / shallow depth of field 등 명시) ⑥색감(warm tones / desaturated / vivid 등) — 이미지 스타일 "${imageStyle}"을 반드시 포함하고 전 씬 동일하게 유지`}${visualCharDesc ? ', 인물 외모 일치 필수' : ''}. ⚠ PROMPT에 절대 포함 금지: 따옴표 안 문장, 대사 인용, | 기호 이후 텍스트, text, letters, words, subtitles, captions, watermark, sign, banner, typography, writing, quote — 이미지 안에 어떤 글자도 없어야 함. PROMPT는 순수 시각 묘사만.
 - PROMPT_KO: 위 PROMPT가 담은 장면 내용을 한국어로 1~2문장 설명 (이미지 프롬프트 해석)
 - CHUNK_EN: SCRIPT_CHUNK 전체를 자연스러운 영어로 번역 (원문 길이 그대로, 요약 금지)
 - [SCENE]과 [/SCENE] 태그는 반드시 유지
-
-【씬 연속성 규칙 — 필수】
+${isInfoContent ? `
+【시각 다양성 필수 — 정보성 콘텐츠】
+- 이 배치 내 모든 장면 PROMPT가 서로 다른 공간·상황·인물 조합을 사용해야 함
+- 연속 2개 이상 같은 배경(노트북 책상, 사무실 환경 등)으로 PROMPT 작성 절대 금지
+- 각 장면마다 새로운 장소(가게 내부, 현장 사무실, 주거공간, 교통수단, 창고, 훈련센터 등)를 다양하게 활용할 것
+` : ''}
+${isInfoContent ? `【씬 독립성 규칙 — 정보성 콘텐츠 필수】
+- 각 씬은 담당하는 정보·정책 주제에 맞는 독립적인 장면으로 구성할 것
+- 이전 씬 배경과 달라도 됨 — 오히려 다른 장소·상황이 권장됨
+- VISUAL_HINT가 있는 씬은 반드시 그 힌트 방향을 PROMPT의 핵심 장면으로 사용할 것
+- 동일한 설정(책상, 사무실, 노트북 등)이 배치 내에서 2회 이상 등장하면 규칙 위반
+- 【스타일 일관성 필수】모든 씬의 PROMPT에 이미지 스타일 "${imageStyle}"을 반드시 포함. 배치마다 스타일 표현이 달라지지 않도록 동일한 문구로 유지할 것` : `【씬 연속성 규칙 — 필수】
 - 같은 씬 내: 인물 외모·복장·배경이 처음부터 끝까지 일관되게 유지
 - 연속된 씬 사이: 앞 씬 끝부분의 인물·장소·분위기가 다음 씬 시작과 자연스럽게 이어져야 함
 - 장소·배경이 바뀔 경우에도 인물 외모(복장 등)는 동일하게 유지
 - 급격한 배경·인물 단절 금지 — 시청자가 같은 이야기를 보고 있다는 느낌이 유지되어야 함
+- 【스타일 일관성 필수】모든 씬의 PROMPT에 이미지 스타일 "${imageStyle}"을 반드시 포함. 배치가 바뀌어도 스타일 표현이 동일한 문구로 유지될 것
 ${firstScenePrompt ? `- 1번 씬 PROMPT를 전체 기준으로 삼아 인물·배경의 세계관을 끝까지 일관되게 유지할 것` : ''}
 ${prevScenePrompt ? `- 이전 씬 PROMPT를 참고해 이 배치 첫 번째 씬의 인물·배경을 자연스럽게 연결할 것` : ''}
 
@@ -1361,10 +1916,114 @@ ${prevScenePrompt ? `- 이전 씬 PROMPT를 참고해 이 배치 첫 번째 씬�
 - 인물 반복 등장 시 자세·방향·동작을 바꿔라 (서있기 → 앉기 → 걷기 → 달리기 → 등 돌리기 → 웅크리기 등)
 - close-up → medium → wide 흐름이 3회 이상 반복되면 순서를 역전하거나 섞어라
 - 배경이 같더라도 카메라 위치와 프레이밍을 달리해서 시각적 변화를 줘라
-
+`}
+${genreForbiddenBlock}
 ${FORBIDDEN_EN}`;
+  };
 
+  let storyContext = null;
   try {
+    // ── 소설/드라마: 스토리 컨텍스트 사전 분석 ────────────────────────────────
+    if (!isInfoContent) {
+      const storyCtxPath = pDir(projectId, 'story_context.json');
+      if (fs.existsSync(storyCtxPath)) {
+        try {
+          storyContext = JSON.parse(fs.readFileSync(storyCtxPath, 'utf8'));
+          console.log('[SCENES] 스토리 컨텍스트 캐시 사용');
+        } catch (e) { storyContext = null; }
+      }
+      if (!storyContext) {
+        console.log('[SCENES] 소설/드라마 — 대본 전체 분석 중...');
+        try {
+          // [S-3] 장르 continuity.rules → 분석 프롬프트 앞에 주입 (장르 감지 시)
+          const _genreContRules = Array.isArray(_genreDef?.continuity?.rules) && _genreDef.continuity.rules.length
+            ? `\n【장르 연속성 필수 규칙】\n${_genreDef.continuity.rules.map((r, i) => `${i + 1}. ${r}`).join('\n')}\n`
+            : '';
+          const analysisPrompt = `다음은 YouTube 영상 대본입니다. 이미지 생성 AI가 각 장면을 일관성 있게 시각화할 수 있도록 대본을 분석해 주세요.${_genreContRules}
+
+대본 (총 ${sceneCount}개 장면으로 나뉠 예정):
+${scriptNorm.slice(0, 8000)}${scriptNorm.length > 8000 ? '\n...(이후 생략)' : ''}
+
+아래 JSON 형식으로만 반환하세요 (다른 설명 없음):
+{
+  "characters": [
+    {"name":"인물이름","appearance":"나이대·체형·헤어·의상 기본 스타일 (시각적 특징만, 영어 아닌 한국어)","costume_changes":[{"from_scene":1,"desc":"이 씬부터 적용되는 의상"}]}
+  ],
+  "locations": [
+    {"name":"장소명","visual":"시각적 특징 (조명·분위기·주요 오브젝트)","scene_range":[시작씬번호,끝씬번호]}
+  ],
+  "emotional_arc": [
+    {"scene_range":[시작씬,끝씬],"state":"감정 한 단어","note":"간단한 상황 설명"}
+  ],
+  "continuity_rules": ["씬 전반에 유지해야 할 시각적 규칙. 예: 주인공은 항상 낡은 가방 소지"],
+  "story_beats": [{"scene":씬번호,"event":"이 씬의 주요 전환점 (장소·의상·감정 변화 포함)"}]
+}
+
+주의: 시각화에 필요한 정보만 추출. 장면 번호는 1~${sceneCount}. JSON만 출력.`;
+          const analysisRaw = await geminiText({
+            apiKey: geminiKey,
+            prompt: analysisPrompt,
+            maxTokens: 3000,
+            temp: 0.2,
+            model: 'gemini-2.5-flash',
+            thinkingBudget: 0
+          });
+          const jsonMatch = analysisRaw.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            storyContext = JSON.parse(jsonMatch[0]);
+            fs.writeFileSync(storyCtxPath, JSON.stringify(storyContext, null, 2), 'utf8');
+            console.log(`[SCENES] 스토리 분석 완료 — 인물 ${storyContext.characters?.length || 0}명, 장소 ${storyContext.locations?.length || 0}개`);
+          }
+        } catch (e) {
+          console.log('[SCENES] 스토리 분석 실패 (스킵):', e.message);
+        }
+      }
+    }
+
+    // ── 정보성 콘텐츠: 사전 분석 패스 (NotebookLM 방식) ──────────────────────
+    if (isInfoContent) {
+      console.log('[SCENES] 정보성 콘텐츠 — 장면별 시각 힌트 사전 분석 중...');
+      try {
+        const preAnalysisPrompt = `다음은 정보성 YouTube 대본입니다. 이 대본을 ${sceneCount}개 장면으로 나눌 때, 각 장면에 가장 적합한 시각화 방향을 분석해 주세요.
+
+대본:
+${scriptNorm.slice(0, 6000)}${scriptNorm.length > 6000 ? '\n...(이후 생략)' : ''}
+
+각 장면 번호(1~${sceneCount})에 대해 아래 JSON 배열 형식으로만 반환하세요:
+[{"num":1,"topic":"이 구간의 핵심 정책명·기관명·수치 (구체적으로, 예: '재도전특별자금 최대 7천만 원 / 소상공인시장진흥공단')","visual":"이 정책의 핵심 혜택이 실제 삶에서 실현되는 결과 장면 또는 상징 장면 (공간+인물+결과, 한국어 1~2문장)","presenter":"이 씬에 진행자가 등장하는 경우 외모·복장 묘사 1줄, 없으면 빈 문자열"}]
+
+규칙:
+- topic: "소상공인 지원" 같은 모호한 카테고리 표현 금지 — 대본에 나온 실제 정책명·기관명·수치 포함
+- visual: 대본에 등장하는 실제 수치·정책명을 반영한 결과 장면 또는 상징 장면. "서류 확인"·"스마트폰 보는 사람"·"노트북 앞 직원" 반복 패턴 절대 금지
+  - 결과 장면 예시: 재도전특별자금→낡은 가게에 새 간판 달고 환하게 웃는 사장님 / 청년버팀목전세→새 아파트 현관에서 열쇠 건네받는 20대 / 신혼부부디딤돌→계약서에 도장 찍으며 마주보고 웃는 부부 / 근로자생활안정자금→병원 접수창구에서 안도한 표정의 직장인 / 긴급복지지원→주민센터 상담 마치고 무거운 짐 내려놓은 듯 안도하는 가족
+  - 상징 장면 예시: 위기극복자금→비 오는 날 창밖 보며 정부지원 서류에 안도하는 사장님 / 창업도약패키지→스타트업 사무실에서 투자자와 악수하는 청년 창업자 / 에너지바우처→따뜻한 방에서 전기요금 고지서 보며 안도하는 어르신 / 디딤돌대출→생애 첫 계약서에 서명하는 손과 열쇠
+- 각 장면 visual이 서로 다른 공간·인물·상황으로 구성될 것 (연속 2개 이상 동일 패턴 금지)
+- presenter: 영상에 진행자가 일관되게 등장한다면 첫 등장 장면에서 외모·복장 상세 기록하고 이후 장면에서도 동일하게 재기술 (인물 연속성 유지)
+- JSON만 출력, 다른 설명 없음`;
+
+        const hintRaw = await geminiText({
+          apiKey: geminiKey,
+          prompt: preAnalysisPrompt,
+          maxTokens: 3000,
+          temp: 0.3,
+          model: 'gemini-2.5-flash',
+          thinkingBudget: 0
+        });
+        const jsonMatch = hintRaw.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          sceneVisualHints = JSON.parse(jsonMatch[0]);
+          console.log(`[SCENES] 시각 힌트 분석 완료: ${sceneVisualHints.length}개 장면`);
+          const presenterHint = sceneVisualHints.find(h => h.presenter && h.presenter.trim());
+          if (presenterHint) {
+            infoPresenterDesc = presenterHint.presenter.trim();
+            console.log(`[SCENES] 진행자 외모 추출 완료: ${infoPresenterDesc.slice(0, 60)}...`);
+          }
+        }
+      } catch (e) {
+        console.log('[SCENES] 시각 힌트 분석 실패 (스킵):', e.message);
+      }
+    }
+
     // ── 배치 단위로 장면 생성 ────────────────────────────────────────────────
     const allChunks = chunks.map((chunk, i) => ({ idx: i + 1, chunk }));
     let scenes = [];
@@ -1375,25 +2034,27 @@ ${FORBIDDEN_EN}`;
       const batch = allChunks.slice(b, b + BATCH);
       console.log(`[SCENES] 배치 ${Math.floor(b/BATCH)+1} — 장면 ${batch[0].idx}~${batch[batch.length-1].idx}`);
       try {
+        // 정보성 콘텐츠는 진행자 책상 장면(1번)을 전체 기준점으로 강제하지 않음
         const raw = await geminiText({
           apiKey: geminiKey,
-          prompt: buildPrompt(makeBatchTemplate(batch), prevScenePrompt, firstScenePrompt),
+          prompt: buildPrompt(makeBatchTemplate(batch), prevScenePrompt, isInfoContent ? '' : firstScenePrompt, batch[0].idx, batch[batch.length - 1].idx),
           maxTokens: 8192,
           temp: 0.7,
-          model: 'gemini-2.5-flash'
+          model: 'gemini-2.5-flash',
+          thinkingBudget: 0
         });
-        const parsed = parseScenes(raw);
+        const parsed = enforceAnchorKeywords(parseScenes(raw));
         console.log(`[SCENES] 배치 결과: ${parsed.length}/${batch.length}`);
         if (parsed.length === 0) console.log('[SCENES] raw 첫200자:', raw.slice(0, 200));
         scenes.push(...parsed);
-        // 1번 씬 기준점 저장 (최초 1회)
-        if (parsed.length > 0 && !firstScenePrompt) {
-          firstScenePrompt = (parsed[0].prompt || '').slice(0, 200);
+        // 1번 씬 기준점 저장 (최초 1회, 일반 콘텐츠만)
+        if (!isInfoContent && parsed.length > 0 && !firstScenePrompt) {
+          firstScenePrompt = (parsed[0].prompt || '').slice(0, 400);
         }
         // 다음 배치 연속성을 위해 마지막 씬 PROMPT 저장
         if (parsed.length > 0) {
           const last = parsed[parsed.length - 1];
-          prevScenePrompt = (last.prompt || '').slice(0, 250);
+          prevScenePrompt = (last.prompt || '').slice(0, 400);
         }
       } catch (e) {
         console.log(`[SCENES] 배치 오류: ${e.message}`);
@@ -1412,12 +2073,13 @@ ${FORBIDDEN_EN}`;
         try {
           const raw2 = await geminiText({
             apiKey: geminiKey,
-            prompt: buildPrompt(makeBatchTemplate(batch), prevScenePrompt, firstScenePrompt),
+            prompt: buildPrompt(makeBatchTemplate(batch), '', '', batch[0].idx, batch[batch.length - 1].idx),
             maxTokens: 8192,
             temp: 0.5,
-            model: 'gemini-2.5-flash'
+            model: 'gemini-2.5-flash',
+            thinkingBudget: 0
           });
-          scenes.push(...parseScenes(raw2));
+          scenes.push(...enforceAnchorKeywords(parseScenes(raw2)));
         } catch (e) {
           console.log(`[SCENES] 재시도 배치 오류: ${e.message}`);
         }
@@ -1432,11 +2094,21 @@ ${FORBIDDEN_EN}`;
     const chunkMap = Object.fromEntries(allChunks.map(({ idx, chunk }) => [idx, chunk]));
     scenes.forEach(sc => { sc.scriptChunk = chunkMap[sc.sceneNumber] || ''; });
 
+    // ── 정보성 콘텐츠: 씬별 기관/전화/사이트 오버레이 추출 ──────────────────────
+    if (isInfoContent) {
+      scenes.forEach(sc => {
+        const overlay = extractInfoOverlay(sc.scriptChunk || '');
+        if (overlay) sc.infoOverlay = overlay;
+      });
+      const overlayCount = scenes.filter(s => s.infoOverlay).length;
+      console.log(`[Scenes] infoOverlay 추출: ${overlayCount}/${scenes.length}개 장면`);
+    }
+
     // ── 캐릭터 태그 → 모든 씬 searchQuery에 자동 주입 ──────────────────────────
     let charTags = '';
     if (visualCharDesc && visualCharDesc.trim()) {
       // 영어 시각 키워드만 추출 (3글자 이상, 불용어 제외)
-      const stopWords = new Set(['with','from','that','this','their','have','into','also','each','very','such','long','dark','pale','light']);
+      const stopWords = new Set(['with','from','that','this','their','have','into','also','each','very','such','long','dark','pale','light','all','characters','must','appearance','features','facial','asian','korean','western','european','caucasian','hispanic','latino','african','middle','eastern','arabic','south']);
       const words = visualCharDesc
         .replace(/[^a-zA-Z\s]/g, ' ')
         .split(/\s+/)
@@ -1456,12 +2128,104 @@ ${FORBIDDEN_EN}`;
     meta.characterDescOriginal = characterDesc;
     meta.characterDesc = visualCharDesc;
     meta.charTags = charTags;
+    if (genreCode) meta.genre = genreCode;
     meta.status = 'scenes_done';
     fs.writeFileSync(pDir(projectId, 'meta.json'), JSON.stringify(meta, null, 2));
 
-    res.json({ scenes, requested: sceneCount, generated: scenes.length, visualCharDesc, charTags });
+    // [S-4] 시리즈: 에피소드 완료 시 series_continuity.json 자동 저장
+    if (_seriesName) {
+      try {
+        const _lastScene   = scenes.length > 0 ? scenes[scenes.length - 1] : null;
+        const _firstScene  = scenes.length > 0 ? scenes[0] : null;
+        const _activeChars = storyContext?.characters?.map(c => c.name) || [];
+        const _lastLocation = storyContext?.locations?.slice(-1)[0]?.name || '';
+
+        // [S-4a] character_visual_snapshot 빌드
+        // 실제 생성된 씬 PROMPT에서 캐릭터별 외형 기준점을 추출해 저장
+        // 다음 화 carry-over 시 canonical_prompt를 보완하는 근거로 사용
+        const _cvSnapshot = {};
+        try {
+          const _snapReg = loadCharacterRegistry(_seriesName);
+          for (const c of Object.values(_snapReg.characters || {})) {
+            if (!c.name) continue;
+            const _aliases = Array.isArray(c.aliases) ? c.aliases : [];
+            const _allNames = [c.name, ..._aliases].map(n => n.toLowerCase());
+            // 이 캐릭터가 등장하는 씬 중 첫 번째 PROMPT를 confirmed_prompt로 저장
+            const _confirmedScene = scenes.find(sc => {
+              if (!sc.prompt) return false;
+              const pl = sc.prompt.toLowerCase();
+              return _allNames.some(n => n.split(/\s+/).some(tok => tok.length >= 3 && pl.includes(tok)));
+            });
+            if (_confirmedScene) {
+              _cvSnapshot[c.name] = {
+                confirmed_prompt: _confirmedScene.prompt.slice(0, 300),
+                scene_confirmed:  _confirmedScene.sceneNumber,
+                episode:          _episode,
+              };
+            }
+          }
+        } catch (e) {
+          console.log('[Scenes] character_visual_snapshot 빌드 실패 (스킵):', e.message);
+        }
+
+        saveEpisodeContinuity(_seriesName, projectId, _episode, {
+          title:                     meta.topic || '',
+          last_scene_prompt:         _lastScene?.prompt?.slice(0, 400)  || '',
+          anchor_scene_prompt:       _firstScene?.prompt?.slice(0, 500) || '',
+          character_visual_snapshot: _cvSnapshot,
+          last_location:             _lastLocation,
+          active_characters:         _activeChars,
+          open_threads:              [],
+          key_events_completed:      [],
+          story_time:                {},
+        });
+        console.log(`[Scenes] series_continuity 저장 완료: ${_seriesName} ${_episode}화 / snapshot ${Object.keys(_cvSnapshot).length}명`);
+      } catch (e) {
+        console.log('[Scenes] series_continuity 저장 실패 (스킵):', e.message);
+      }
+    }
+
+    const ethnicityLabels = {
+      'all characters must be East Asian Korean appearance with Asian facial features': '동양인 (한국/동아시아)',
+      'all characters must be Western European Caucasian appearance with European facial features': '서양인 (유럽/서양)',
+      'all characters must be Hispanic or Latino appearance with Latin American facial features': '라틴/히스패닉',
+      'all characters must be South Asian Indian appearance with South Asian facial features': '남아시아 (인도/남아시아)',
+      'all characters must be African Black appearance with African facial features': '아프리카인',
+      'all characters must be Middle Eastern Arabic appearance with Middle Eastern facial features': '중동/아랍',
+    };
+    const ethnicLabel = ethnicityLabels[characterEthnicity] || (characterEthnicity ? '직접 지정' : '동양인 자동 적용 (한국어 대본 기준)');
+    let charOnly = characterDesc;
+    for (const ev of Object.keys(ethnicityLabels)) charOnly = charOnly.split(ev).join('');
+    charOnly = charOnly.replace(/^\.\s*/, '').replace(/\.\s*$/, '').trim();
+
+    const appliedGuidelines = [
+      // 인물 인종
+      { icon: '👤', label: '인물 인종',
+        value: charOnly
+          ? `${ethnicLabel} — 모든 장면 인물에 일관 적용 / 인물 설명: ${charOnly.length > 50 ? charOnly.slice(0,50)+'…' : charOnly}`
+          : `${ethnicLabel} — 모든 장면 인물에 일관 적용` },
+      // 이미지 스타일 (사용자 선택값 그대로)
+      { icon: '🎨', label: '이미지 스타일', value: imageStyle.split(',')[0].trim() },
+      // 이미지 생성 규칙
+      isInfoContent
+        ? { icon: '📋', label: '이미지 생성 규칙',
+            value: '정보성 콘텐츠 — 설명자 단독 등장 금지. 대본의 핵심 내용(지원제도·기관·혜택)이 실제 삶에 적용되는 장면으로 시각화. 유관기관 언급 시 해당 상황·환경 표출.' }
+        : { icon: '🎭', label: '이미지 생성 규칙',
+            value: '일반/이야기 콘텐츠 — 대본 장면의 인물·행동·감정·배경 충실히 시각화. 원작 소설·이야기 기반 시 원작 묘사에 최대한 가깝게 생성.' },
+      // 쇼츠 모드
+      isShorts
+        ? { icon: '📱', label: '쇼츠 모드', value: `세로(9:16) 구도, 클로즈업·중앙 구성 적용, 최대 ${sceneCount}장면` }
+        : null,
+      // 사용자 특별지침
+      meta.specialInstructions
+        ? { icon: '⭐', label: '사용자 특별지침',
+            value: meta.specialInstructions.length > 80 ? meta.specialInstructions.slice(0,80)+'…' : meta.specialInstructions }
+        : null,
+    ].filter(Boolean);
+
+    res.json({ scenes, requested: sceneCount, generated: scenes.length, visualCharDesc, charTags, appliedGuidelines });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -1469,9 +2233,9 @@ ${FORBIDDEN_EN}`;
 // TTS 생성 (SSE 스트리밍)
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/tts/generate', async (req, res) => {
-  const { projectId, voiceName = 'Aoede', speed = 'normal' } = req.body;
   const geminiKey = resolveKey(req.body.geminiKey);
   if (!geminiKey) { res.status(400).json({ error: 'Gemini API Key 필요 (UI에서 입력 후 저장하세요)' }); return; }
+  const { projectId } = req.body;
   if (!projectId) { res.status(400).json({ error: 'projectId 필요' }); return; }
 
   const scriptPath = pDir(projectId, 'script.txt');
@@ -1480,24 +2244,43 @@ app.post('/api/tts/generate', async (req, res) => {
   // TTS 전용 청크 크기 (작게 유지해야 타임아웃 방지)
   const meta      = JSON.parse(fs.readFileSync(pDir(projectId, 'meta.json'), 'utf8'));
   const ttsLang   = meta.scriptLang || 'ko';
+
+  // genre_engine 기반 기본 voice/speed — UI 명시값이 없을 때만 적용
+  const _ttsGenreDef = getGenreDef(meta);
+  const genreVoice = _ttsGenreDef?.tts?.voice || 'Aoede';
+  const genreSpeed = _ttsGenreDef?.tts?.speed || 'normal';
+  const voiceName = req.body.voiceName || genreVoice;
+  const speed     = req.body.speed     || genreSpeed;
+
+  // bible 장르: system_prompt_hint + sacred_tone_rules 기반 TTS prefix 오버라이드
+  const _ttsGenreCode = resolveGenre(meta);
+  const _genreTtsHint = _ttsGenreDef?.tts?.system_prompt_hint;
+  const _sacredTones  = _ttsGenreDef?.sacred_tone_rules;
+  if (_ttsGenreCode && (_ttsGenreCode === 'bible_drama' || _ttsGenreCode === 'bible_history') && _genreTtsHint) {
+    const _sacredSuffix = _sacredTones?.[0] ? ` Tone principle: ${_sacredTones[0]}` : '';
+    const _overridePrefix = `${_genreTtsHint}${_sacredSuffix} Text: `;
+    // TTS_STYLE_OVERRIDE: geminiTTS 호출 시 stylePrefix 대신 사용할 값을 meta에 임시 저장
+    meta._ttsPrefixOverride = _overridePrefix;
+  }
   const chunkSize = ttsChunkSize();
   console.log(`[TTS] videoLength=${meta.videoLength} lang=${ttsLang} → TTS chunkSize=${chunkSize}자`);
 
   sseHeaders(res);
 
   // ── SSE 연결 유지 (20초마다 keepalive ping) ──────────────────────────────
-  const keepalive = setInterval(() => { try { res.write(': ping\n\n'); } catch(_) {} }, 20_000);
+  const keepalive = setInterval(() => { try { res.write(': ping\n\n'); } catch(_) {} }, 10_000);
 
   const script   = fs.readFileSync(scriptPath, 'utf8');
   const audioDir = pDir(projectId, 'audio');
   mkDir(audioDir);
 
   const segments = splitScript(script, chunkSize);
-  const results  = [];
+  const results  = new Array(segments.length).fill(null);
 
   sseSend(res, { type: 'start', total: segments.length });
 
-  for (let i = 0; i < segments.length; i++) {
+  // 세그먼트 1개 처리 (TTS → 속도조정 → 노이즈제거)
+  const processSegment = async (i) => {
     const seg      = segments[i];
     const fileName = `segment_${String(i + 1).padStart(3, '0')}.wav`;
     const filePath = path.join(audioDir, fileName);
@@ -1505,55 +2288,34 @@ app.post('/api/tts/generate', async (req, res) => {
     sseSend(res, { type: 'progress', index: i + 1, total: segments.length, text: seg.slice(0, 60) + '…' });
 
     try {
-      const b64 = await geminiTTS({ apiKey: geminiKey, text: seg, voiceName, lang: ttsLang });
+      const b64 = await geminiTTS({ apiKey: geminiKey, text: seg, voiceName, lang: ttsLang, prefixOverride: meta._ttsPrefixOverride });
       const wav = pcmToWav(b64);
       fs.writeFileSync(filePath, wav);
 
-      // 속도 조정 (보통 제외) — FFmpeg atempo 필터
+      // 속도 조정 + 노이즈 제거 + 볼륨 정규화 — 단일 FFmpeg 패스로 처리
       const atempo = resolveAtempo(speed);
-      console.log(`[Speed] segment_${i+1} speed=${speed} atempo=${atempo}`);
-      if (atempo !== 1.0) {
-        const tmpPath = filePath + '.tmp.wav';
-        try {
-          await new Promise((resolve, reject) => {
-            ffmpeg()
-              .input(filePath)
-              .audioFilters(`atempo=${atempo}`)
-              .audioCodec('pcm_s16le')
-              .audioFrequency(24000)
-              .audioChannels(1)
-              .output(tmpPath)
-              .on('end', () => { console.log(`[Speed] segment_${i+1} atempo 완료`); resolve(); })
-              .on('error', (e) => { console.error(`[Speed] segment_${i+1} atempo 오류:`, e.message); reject(e); })
-              .run();
-          });
-          fs.renameSync(tmpPath, filePath);
-        } catch(e) {
-          console.error('[Speed] atempo 실패, 원본 사용:', e.message);
-          if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-        }
-      }
-
-      // ── 세그먼트별 노이즈 제거 + 볼륨 정규화 (톤 일관성 확보) ──
-      const normTmp = filePath + '.norm.wav';
+      console.log(`[Post] segment_${i+1} speed=${speed} atempo=${atempo}`);
+      const postTmp = filePath + '.post.wav';
+      const audioFilter = atempo !== 1.0
+        ? `atempo=${atempo},highpass=f=80,afftdn=nf=-25,loudnorm=I=-18:TP=-1.5:LRA=5:linear=true`
+        : 'highpass=f=80,afftdn=nf=-25,loudnorm=I=-18:TP=-1.5:LRA=5:linear=true';
       try {
         await new Promise((resolve, reject) => {
           ffmpeg()
             .input(filePath)
-            // highpass: 저음 잡음 제거 / afftdn: 배경 노이즈 / loudnorm: 세그먼트별 볼륨 통일
-            .audioFilters('highpass=f=80,afftdn=nf=-25,loudnorm=I=-18:TP=-1.5:LRA=5:linear=true')
+            .audioFilters(audioFilter)
             .audioCodec('pcm_s16le')
             .audioFrequency(24000)
             .audioChannels(1)
-            .output(normTmp)
+            .output(postTmp)
             .on('end', () => {
-              fs.renameSync(normTmp, filePath);
-              console.log(`[Denoise] segment_${i+1} 정규화 완료`);
+              fs.renameSync(postTmp, filePath);
+              console.log(`[Post] segment_${i+1} 완료`);
               resolve();
             })
             .on('error', (e) => {
-              console.warn(`[Denoise] segment_${i+1} 정규화 실패, 원본 사용:`, e.message);
-              if (fs.existsSync(normTmp)) fs.unlinkSync(normTmp);
+              console.warn(`[Post] segment_${i+1} 실패, 원본 사용:`, e.message);
+              if (fs.existsSync(postTmp)) fs.unlinkSync(postTmp);
               resolve();
             })
             .run();
@@ -1562,28 +2324,34 @@ app.post('/api/tts/generate', async (req, res) => {
 
       const dur = await audioDuration(filePath);
       const row = { index: i + 1, fileName, duration: dur, durationFmt: fmtSec(dur), text: seg.slice(0, 80), url: `/api/project/${projectId}/audio/${fileName}` };
-      results.push(row);
       sseSend(res, { type: 'segment', ...row });
+      return row;
     } catch (err) {
       const row = { index: i + 1, fileName, error: err.message, text: seg.slice(0, 80) };
-      results.push(row);
       sseSend(res, { type: 'segment_error', ...row });
+      return row;
     }
+  };
 
-    // 구간 사이 1초 대기 — Gemini API 레이트 리밋 방지 (마지막 구간 제외)
-    if (i < segments.length - 1) {
-      await new Promise(ok => setTimeout(ok, 1000));
+  // 최대 5개 동시 처리 — Gemini TTS RPM 10~15 기준 안전 범위 (배치당 1.5초 간격)
+  const TTS_CONCURRENCY = 5;
+  for (let i = 0; i < segments.length; i += TTS_CONCURRENCY) {
+    const indices  = Array.from({ length: Math.min(TTS_CONCURRENCY, segments.length - i) }, (_, j) => i + j);
+    const batch    = await Promise.all(indices.map(idx => processSegment(idx)));
+    batch.forEach((r, j) => { results[i + j] = r; });
+    if (i + TTS_CONCURRENCY < segments.length) {
+      await new Promise(ok => setTimeout(ok, 1500));
     }
   }
 
-  // 전체 오디오 합치기
-  const okFiles = results.filter(r => !r.error).map(r => path.join(audioDir, r.fileName));
+  // 전체 오디오 합치기 (null 슬롯 방어: Promise 중단 시 null 잔류 가능)
+  const okFiles = results.filter(r => r && !r.error).map(r => path.join(audioDir, r.fileName));
   const fullPath = path.join(audioDir, 'audio_full.wav');
   let totalDuration = 0;
   let mergeError = null;
 
   // 세그먼트 duration 합산 (fallback용)
-  const sumDuration = results.filter(r => !r.error).reduce((acc, r) => acc + (r.duration || 0), 0);
+  const sumDuration = results.filter(r => r && !r.error).reduce((acc, r) => acc + (r.duration || 0), 0);
 
   if (okFiles.length > 1) {
     const listFile    = path.join(audioDir, 'concat.txt');
@@ -1593,13 +2361,21 @@ app.post('/api/tts/generate', async (req, res) => {
     sseSend(res, { type: 'merging' });
 
     // ── 크로스페이드 병합: 세그먼트 경계에서 80ms 자연스럽게 섞음 ──────────────
+    // 세그먼트가 20개 초과면 성능상 concat+loudnorm으로 대체 (FFmpeg 횟수 49→1회)
     const XFADE_MS = 0.08; // 80ms 크로스페이드
     const mergeWithCrossfade = async () => {
       if (okFiles.length === 1) {
         fs.copyFileSync(okFiles[0], fullPath);
         return;
       }
-      // 첫 번째 = 베이스, 이후 순차적으로 acrossfade 체이닝
+      // 세그먼트가 많을 때(10개 이상)는 순차 체이닝 대신 concat+loudnorm으로 처리
+      // (19회 ffmpeg 실행 → 1회로 단축, 속도 대폭 개선)
+      if (okFiles.length > 9) {
+        console.log(`[TTS] 세그먼트 ${okFiles.length}개 — concat+loudnorm 방식 사용 (크로스페이드 생략)`);
+        await runMerge(['-af', 'loudnorm=I=-16:LRA=7:TP=-1.5:linear=true', '-c:a', 'pcm_s16le', '-ar', '24000', '-ac', '1']);
+        return;
+      }
+      // 20개 이하: 순차 크로스페이드 체이닝
       let currentPath = okFiles[0];
       for (let ci = 1; ci < okFiles.length; ci++) {
         const outCf = path.join(audioDir, `_cf_${ci}.wav`);
@@ -1645,9 +2421,9 @@ app.post('/api/tts/generate', async (req, res) => {
     });
 
     try {
-      // 1차: 크로스페이드 병합 (경계 자연스럽게)
+      // 1차: 크로스페이드 병합 (경계 자연스럽게, 또는 대용량 시 concat+loudnorm)
       await mergeWithCrossfade();
-      console.log('[TTS] 크로스페이드 병합 성공');
+      console.log('[TTS] 병합 성공');
     } catch (e1) {
       console.log('[TTS] 크로스페이드 실패, loudnorm 단순병합 시도:', e1.message);
       try {
@@ -1737,7 +2513,7 @@ app.post('/api/tts/generate', async (req, res) => {
 
   // 메타 업데이트
   // segments에 fullText 보존 (SRT 자막용)
-  const resultsWithText = results.map((r, i) => ({ ...r, fullText: segments[i] || '' }));
+  const resultsWithText = results.map((r, i) => r ? { ...r, fullText: segments[i] || '' } : { index: i + 1, error: '처리 안됨', text: '' });
   meta.tts = { voiceName, speed, chunkSize, segments: resultsWithText, totalDuration, totalDurationFmt: fmtSec(totalDuration) };
   meta.status = 'tts_done';
   fs.writeFileSync(pDir(projectId, 'meta.json'), JSON.stringify(meta, null, 2));
@@ -1814,7 +2590,7 @@ app.post('/api/tts/sample', async (req, res) => {
     const dur  = await audioDuration(filePath);
     res.json({ url: `/api/project/${projectId || '_temp'}/audio/${fileName}`, duration: dur, durationFmt: fmtSec(dur) });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -1838,20 +2614,30 @@ app.post('/api/media/images', async (req, res) => {
   } catch (_) {}
 
   try {
-    const r    = await fetch(`https://api.pexels.com/v1/search?query=${encodeURIComponent(finalQuery)}&per_page=12&orientation=landscape`, {
-      headers: { Authorization: pexelsKey }
-    });
-    const d    = await r.json();
-    const photos = (d.photos || []).map(p => ({
-      id: p.id,
-      src: p.src.landscape || p.src.large2x || p.src.large,
-      thumb: p.src.medium,
-      photographer: p.photographer,
-      url: p.url
-    }));
+    const searchPexelsPhotos = async (q) => {
+      const r = await fetch(`https://api.pexels.com/v1/search?query=${encodeURIComponent(q)}&per_page=12&orientation=landscape`, {
+        headers: { Authorization: pexelsKey }
+      });
+      if (!r.ok) throw new Error(`Pexels 오류 (${r.status})`);
+      const d = await r.json();
+      return (d.photos || []).map(p => ({
+        id: p.id,
+        src: p.src.landscape || p.src.large2x || p.src.large,
+        thumb: p.src.medium,
+        photographer: p.photographer,
+        url: p.url
+      }));
+    };
+    let photos = await searchPexelsPhotos(finalQuery);
+    // 0결과 시 첫 단어만으로 재시도
+    if (photos.length === 0 && finalQuery.includes(' ')) {
+      const simpleQuery = finalQuery.split(' ')[0];
+      console.log(`[Pexels] 0결과 → 단순 쿼리 재시도: "${simpleQuery}"`);
+      photos = await searchPexelsPhotos(simpleQuery);
+    }
     res.json({ photos });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -1936,7 +2722,7 @@ async function tryGenerateImage(apiKey, fullPrompt, styleSeed = null, aspectRati
         console.log(`[Image] Pollinations(${polModel}) 시도 ${attempt + 1}/3…`);
 
         const ctrl  = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 90_000); // 90초
+        const timer = setTimeout(() => ctrl.abort(), 45_000); // 45초 (기존 90초 → UX 개선)
         let rp;
         try {
           rp = await fetch(polUrl, { signal: ctrl.signal });
@@ -1996,9 +2782,17 @@ const getAccuracyRuleKo = () => {
    - 교육: 교육부(moe.go.kr / 044-203-6114), 한국장학재단(kosaf.go.kr / 1599-2000)
    - 법령: 국가법령정보센터(law.go.kr / 044-200-6901)
    - 소상공인·창업: 소상공인시장진흥공단(semas.or.kr / 1357), 중소벤처기업부(mss.go.kr / 1357)
+   - 교통비: K-패스(korea-pass.kr / 1899-2825)
+   - 에너지바우처: 한국에너지공단(energy.or.kr / 1600-3190)
 4. 정보가 불확실하거나 변경 가능성이 있을 경우 반드시 "정확한 내용은 [기관명] 공식 홈페이지(주소) 또는 전화번호 [번호]로 문의하세요"라고 명시하세요.
 5. 추측성·미확인 정보 작성 금지. 확인된 사실만 기술하세요.
-6. 전화번호를 언급할 때는 반드시 숫자 앞에 "전화번호"를 붙여서 TTS가 자연스럽게 읽을 수 있도록 하세요. 예) "전화번호 1357로 문의하시면 됩니다", "전화번호 1588-6565로 연락하세요" — 절대 숫자만 단독으로 쓰지 마세요.`;
+6. 연락처 전화번호를 언급할 때는 반드시 숫자 앞에 "전화번호"를 붙여서 TTS가 자연스럽게 읽을 수 있도록 하세요. 예) "전화번호 1357로 문의하시면 됩니다", "전화번호 1588-6565로 연락하세요". ⚠ 금액(예: 7천만 원, 2억 원, 4조 4천억 원, 25만 원)·수량·날짜·연도·퍼센트 앞에는 절대로 "전화번호"를 붙이지 마세요. 실제 연락처 번호(기관 대표번호, 콜센터 번호 등)에만 적용합니다.
+
+【실질적 내용 제시 규칙 — 포장 금지, 알맹이 필수】
+7. 각 지원 항목을 설명할 때, 해당 내용을 거론하는 바로 그 자리에 ① 정확한 프로그램명 ② 지원 금액 또는 혜택 ③ 신청 기간·마감일 ④ 신청 방법(온라인/방문/전화) ⑤ 담당 기관명·전화번호·홈페이지 주소를 함께 서술하세요. 항목 설명과 신청 정보는 반드시 같은 자리에서 거론되어야 합니다. "나중에 알아보세요" 식으로 미루는 것 금지.
+8. "관련 기관 웹사이트에서 확인하세요", "공식 포털에서 검색하세요"처럼 막연한 표현 절대 금지. 어느 기관인지, 정확한 URL이 무엇인지 대본 안에 직접 말해야 합니다.
+9. 신청 방법은 단계별로 구체적으로 안내하세요. 예) "정부24(www.gov.kr) 접속 → 로그인 → '지원금 신청' 검색 → 해당 항목 선택 → 서류 첨부 후 제출". "신청하시면 됩니다" 한 줄 마무리 금지.
+10. 대본 마지막 CTA 직전에 이 영상에서 다룬 모든 지원 항목의 유관기관을 한 번에 총정리해 안내하세요. 형식: "[지원항목] — [기관명] / 전화번호 [번호] / 홈페이지 [주소]" 형태로 항목별로 나열. 시청자가 영상 끝까지 보면 메모 한 장 분량의 정보를 손에 쥘 수 있어야 합니다.`;
 };
 
 const getAccuracyRuleEn = () => {
@@ -2054,6 +2848,7 @@ app.post('/api/media/generate-image', async (req, res) => {
   let sceneAspectRatio = '16:9';
   // body.characterDesc 없으면 meta.json에서 자동 로드 (continuity 보장)
   let resolvedCharDesc = characterDesc?.trim() || '';
+  let seniorMoodHint = '';
   try {
     const metaPath = pDir(projectId, 'meta.json');
     if (fs.existsSync(metaPath)) {
@@ -2065,6 +2860,15 @@ app.post('/api/media/generate-image', async (req, res) => {
         culturalContext = 'Korean cultural setting. If any text or signs are visible, use Korean Hangul characters only, never English or Latin letters. If traditional clothing is worn, it must be authentic Korean Hanbok ONLY — never Japanese kimono/yukata or Chinese hanfu/qipao or any hybrid Asian costume.';
       }
       if (m.isShorts) sceneAspectRatio = '9:16';
+      // 시니어 감성 힌트 — genre_engine 우선, fallback 기존 regex
+      const _imgGenreDef = getGenreDef(m);
+      const _imgGenreCode = resolveGenre(m);
+      const _isSeniorImg = _imgGenreCode === 'senior_info' ||
+        /시니어|어르신|노인|중년|중장년|은퇴|인생|추억|그리움|가족|손자|손녀|부모님|노후|황혼|소회|회고|감사|위로|치유|힐링/.test(m.topic || '');
+      if (_isSeniorImg) {
+        seniorMoodHint = _imgGenreDef?.continuity?.senior_mood_hint ||
+          'Mood: emotionally warm and nostalgic. Prefer warm golden tones, soft natural lighting. If people appear, show genuine aged faces with expressive wrinkles and kind eyes — never idealized or youthful. Emphasize emotional authenticity over visual perfection.';
+      }
     }
   } catch (_) {}
 
@@ -2089,8 +2893,10 @@ STEP 2 — Supplementary visual context (use only if it adds detail not in the d
 "${prompt}"
 
 Art style: "${imageStyle || ''}"
-${charFull ? `
-⚠ CHARACTER APPEARANCE — MANDATORY IN EVERY IMAGE:
+${seniorMoodHint ? `\n🎨 MOOD GUIDANCE: ${seniorMoodHint}\n` : ''}${charFull ? `
+⚠ CHARACTER APPEARANCE — THIS IS THE HIGHEST PRIORITY RULE:
+The character(s) in the image MUST match this description EXACTLY.
+Do NOT deviate. Do NOT generalize. Copy these details precisely:
 "${charFull}"
 Every physical detail (face, hair, clothing, age, body type) must match exactly. No substitution.
 ` : ''}
@@ -2105,13 +2911,20 @@ OUTPUT FORMAT — Write the prompt in this exact order, all in one flowing Engli
 6. [STYLE] — lighting, color grade, cinematic quality
 
 Rules:
-- The dialogue line DRIVES the image — visualize exactly what the dialogue describes, nothing else
-- DO NOT invent scenes, objects, or characters not present in the dialogue line
-- DO NOT repeat poses or compositions from generic stock imagery
-${charFull ? '- CHARACTER APPEARANCE IS MANDATORY — reproduce every detail precisely' : ''}
-- ⚠ ABSOLUTE BAN: NO TEXT, NO LETTERS, NO WORDS, NO SUBTITLES, NO CAPTIONS, NO WATERMARKS anywhere in the image
+- The image must DIRECTLY illustrate what is described in the Korean narration
+- Structure the prompt in this exact order:
+  1. SUBJECT: who/what is in the scene (character appearance, age, emotion, facial expression, eye contact, body posture)
+  2. ACTION: specific movement or gesture happening right now
+  3. SETTING: location, environment, time of day, weather
+  4. LIGHTING: specify one — golden hour, soft window light, dramatic rim light, warm indoor light, overcast natural light
+  5. CAMERA: specify one — close-up, medium shot, wide establishing shot, over-the-shoulder; add shallow depth of field if portrait
+  6. COLOR: specify tone — warm tones, muted palette, high contrast, soft pastels, cinematic grade
+  7. STYLE: always append "${imageStyle || 'cinematic realistic photography'}"
+${charFull ? '- CHARACTER APPEARANCE IS MANDATORY — reproduce every detail from the description above, do not substitute or approximate' : ''}
+- Emotion must be visible: specify the exact facial expression and body language (e.g. "eyes welling with tears", "warm relieved smile", "furrowed brow of worry", "bright eyes of determination")
+- ⚠ ABSOLUTE BAN: NO TEXT, NO LETTERS, NO WORDS, NO SUBTITLES, NO CAPTIONS, NO WATERMARKS anywhere in the image. Not even blurred, partial, or background text. Pure visual only.
 - NEVER use words like "poster", "sign", "banner", "title", "label", "caption", "text" in the prompt
-- Write in English only, max 250 characters
+- Write in English only, max 300 characters
 - Output ONLY the image prompt, nothing else
 - If traditional Korean clothing appears: write "authentic Korean Hanbok" and add "NOT kimono NOT hanfu"
 
@@ -2168,14 +2981,14 @@ ${/한복|전통\s*의상|전통복/.test(relatedLine) ? HANBOK_STRICT : ''}`,
     res.json({ saved: true, path: `/api/project/${projectId}/images/${fileName}`, usedPrompt: fullPrompt });
   } catch (err) {
     console.error('[Image] 오류:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 인트로 / 아웃트로 영상 업로드
 // ─────────────────────────────────────────────────────────────────────────────
-app.post('/api/media/upload-bookend', express.json({ limit: '500mb' }), async (req, res) => {
+app.post('/api/media/upload-bookend', express.json({ limit: '150mb' }), async (req, res) => {
   const { projectId, role, videoData } = req.body; // role: 'intro' | 'outro'
   if (!projectId || !role || !videoData) return res.status(400).json({ error: '파라미터 부족' });
   if (!['intro','outro'].includes(role)) return res.status(400).json({ error: 'role은 intro|outro' });
@@ -2199,7 +3012,7 @@ app.post('/api/media/upload-bookend', express.json({ limit: '500mb' }), async (r
     console.log(`[Bookend] ${role} 저장: ${(buf.length/1024/1024).toFixed(1)}MB, dur=${dur.toFixed(1)}s`);
     res.json({ saved: true, role, duration: dur });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -2214,14 +3027,14 @@ app.post('/api/media/delete-bookend', (req, res) => {
     fs.writeFileSync(pDir(projectId, 'meta.json'), JSON.stringify(meta, null, 2));
     res.json({ deleted: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 인터뷰 영상 업로드 — projects/{id}/interview/interview_{sceneNum}.mp4
 // ─────────────────────────────────────────────────────────────────────────────
-app.post('/api/media/upload-interview', express.json({ limit: '500mb' }), async (req, res) => {
+app.post('/api/media/upload-interview', express.json({ limit: '150mb' }), async (req, res) => {
   const { projectId, sceneNumber, videoData, fadeDuration = 0.8 } = req.body;
   if (!projectId || sceneNumber == null || !videoData)
     return res.status(400).json({ error: '파라미터 부족' });
@@ -2251,7 +3064,7 @@ app.post('/api/media/upload-interview', express.json({ limit: '500mb' }), async 
     console.log(`[Interview] scene_${sceneNumber} 저장: ${(buf.length/1024/1024).toFixed(1)}MB, dur=${ivDur.toFixed(1)}s`);
     res.json({ saved: true, sceneNumber, duration: ivDur, path: `/api/project/${projectId}/interview/${fileName}` });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -2271,13 +3084,14 @@ app.post('/api/media/delete-interview', (req, res) => {
 
     res.json({ deleted: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
 // 인터뷰 영상 파일 서빙
 app.get('/api/project/:id/interview/:file', (req, res) => {
-  const fp = pDir(req.params.id, 'interview', req.params.file);
+  const fp = safeFilePath(PROJECTS_DIR, req.params.id, 'interview', req.params.file);
+  if (!fp) return res.status(400).end();
   if (!fs.existsSync(fp)) return res.status(404).end();
   res.setHeader('Content-Type', 'video/mp4');
   res.setHeader('Accept-Ranges', 'bytes');
@@ -2388,126 +3202,37 @@ async function spliceInterviewClip(mainVideo, ivVideo, insertTime, ivDur, fadeDu
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BGM 추천 — 대본 분석(Gemini) → Pixabay Music 검색 → 트랙 목록 반환
+// BGM 추천 — Gemini로 대본 무드 분석 → 검색 키워드 + 추천 사이트 안내
+// (Pixabay Music API 폐쇄, ccMixter SSL 만료로 자동 검색 불가 — 키워드 추천 방식으로 운영)
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/media/music-recommend', async (req, res) => {
-  const { projectId, topic, script, pixabayKey } = req.body;
+  const { topic, script } = req.body;
   const geminiKey = resolveKey(req.body.geminiKey);
-  if (!geminiKey)   return res.status(400).json({ error: 'Gemini API Key 필요' });
-  if (!pixabayKey)  return res.status(400).json({ error: 'Pixabay API Key 필요 (무료 가입: pixabay.com)' });
+  if (!geminiKey) return res.status(400).json({ error: 'Gemini API Key 필요' });
 
   try {
-    // Gemini로 대본 무드 분석 → 영어 검색어 5개 추출 (실패 시 기본값 사용)
-    const fallbacks = ['calm piano','peaceful ambient','soft background','gentle acoustic','relaxing'];
-    let queryList = [...fallbacks];
-    try {
-      const moodPrompt = `아래 영상 대본을 읽고, Pixabay 음악 API 검색어를 추천해주세요.
+    const moodPrompt = `아래 영상 대본을 읽고, 배경음악 분위기와 검색 키워드를 추천해주세요.
 
 영상 주제: "${topic || ''}"
 대본 (일부): "${(script || '').slice(0, 1500)}"
 
-규칙:
-- 영어 검색어 5개를 쉼표로만 구분 (예: calm piano, peaceful ambient, gentle background, soft acoustic, relaxing instrumental)
-- 반드시 잔잔하고 평화로운 배경음악(calm, peaceful, soft, gentle, relaxing) 위주로 추천
-- 강렬하거나 빠른 템포 음악 금지 (rock, energetic, upbeat, fast 제외)
-- 인스트루멘탈 배경음악에 적합한 무드/악기 키워드
-- Pixabay Music에서 검색 결과가 잘 나오는 일반적인 키워드 사용 (예: calm piano, ambient, peaceful, relaxing, soft background, gentle acoustic, meditation)
-- 다른 텍스트 없이 검색어 5개만 출력`;
+아래 JSON 형식으로만 응답 (마크다운 없이):
+{"mood":"따뜻하고 잔잔한","keywords":["calm piano","soft ambient","gentle acoustic"],"reason":"이유 한 문장"}`;
 
-      const moodRaw = await geminiText({ apiKey: geminiKey, prompt: moodPrompt, maxTokens: 100, temp: 0.7 });
-      const rawQueries = (moodRaw || '').split(',').map(s => s.trim()).filter(Boolean);
-      if (rawQueries.length > 0) {
-        const merged = [...rawQueries];
-        for (const fb of fallbacks) { if (merged.length >= 5) break; if (!merged.includes(fb)) merged.push(fb); }
-        queryList = merged.slice(0, 5);
-      }
-    } catch (geminiErr) {
-      console.log('[BGM] Gemini 대본 분석 실패, 기본 검색어 사용:', geminiErr.message);
-      // geminiErr은 무시하고 기본 fallback 검색어로 계속 진행
-    }
+    const raw = await geminiText({ apiKey: geminiKey, prompt: moodPrompt, maxTokens: 150, temp: 0.6, thinkingBudget: 0 });
+    const clean = raw.trim().replace(/^```json\s*/,'').replace(/\s*```$/,'').replace(/^```\s*/,'');
+    const result = JSON.parse(clean);
 
-    // Pixabay Music API — 검색어별 최대 6개씩, 중복 제거
-    const tracks = [];
-    const seen   = new Set();
-    let pixabayKeyError = null;
-
-    // HTML 응답 감지 헬퍼 (API 키 없거나 잘못됐을 때 Pixabay가 HTML 반환)
-    const fetchPixabay = async (url) => {
-      const r = await fetch(url, { headers: { 'User-Agent': 'LongformV2/1.0' } });
-      const text = await r.text();
-      if (text.trimStart().startsWith('<')) {
-        throw new Error('INVALID_KEY');
-      }
-      return { r, d: JSON.parse(text) };
-    };
-
-    for (const q of queryList) {
-      try {
-        const url = `https://pixabay.com/api/music/?key=${pixabayKey}&q=${encodeURIComponent(q)}&per_page=6&order=popular`;
-        const { r, d } = await fetchPixabay(url);
-        if (!r.ok || d.error) {
-          console.log(`[BGM] Pixabay 오류(${q}): ${d.error || r.status}`);
-          if (!pixabayKeyError) pixabayKeyError = d.error || `HTTP ${r.status}`;
-          continue;
-        }
-        console.log(`[BGM] "${q}" → ${(d.hits||[]).length}곡`);
-        for (const h of (d.hits || [])) {
-          if (seen.has(h.id)) continue;
-          seen.add(h.id);
-          const preview = h.previewURL || h.audio || '';
-          if (!preview) continue;
-          tracks.push({
-            id:         h.id,
-            title:      h.title || '제목 없음',
-            duration:   h.duration || 0,
-            tags:       h.tags    || '',
-            previewURL: preview,
-            user:       h.user    || '',
-            query:      q
-          });
-          if (tracks.length >= 5) break;
-        }
-        if (tracks.length >= 5) break;
-      } catch (e) {
-        console.log(`[BGM] 검색 오류(${q}): ${e.message}`);
-        if (e.message === 'INVALID_KEY') {
-          pixabayKeyError = 'INVALID_KEY';
-          break; // 키가 없으면 나머지 쿼리도 전부 실패하므로 중단
-        }
-      }
-    }
-
-    // API 키 오류 → 즉시 명확한 에러 반환
-    if (pixabayKeyError === 'INVALID_KEY' || (!tracks.length && pixabayKeyError)) {
-      return res.status(400).json({ error: 'Pixabay API Key가 없거나 잘못됐습니다.\npixabay.com 에서 무료 가입 후 API Key를 발급받아 설정에 입력하세요.\n(이미지 API Key와 동일한 키를 사용합니다)' });
-    }
-
-    if (!tracks.length) {
-      // 마지막 시도: 검색어 없이 popular 목록에서 가져오기
-      try {
-        const url = `https://pixabay.com/api/music/?key=${pixabayKey}&per_page=5&order=popular`;
-        const { r, d } = await fetchPixabay(url);
-        if (!r.ok || d.error) {
-          return res.status(400).json({ error: `Pixabay API Key 오류: ${d.error || r.status}` });
-        }
-        for (const h of (d.hits || [])) {
-          const preview = h.previewURL || h.audio || '';
-          if (!preview) continue;
-          tracks.push({ id: h.id, title: h.title || '제목 없음', duration: h.duration || 0, tags: h.tags || '', previewURL: preview, user: h.user || '', query: 'popular' });
-        }
-      } catch (e) {
-        if (e.message === 'INVALID_KEY') {
-          return res.status(400).json({ error: 'Pixabay API Key가 없거나 잘못됐습니다.\npixabay.com 에서 무료 가입 후 API Key를 발급받아 설정에 입력하세요.' });
-        }
-      }
-    }
-
-    if (!tracks.length) {
-      return res.status(200).json({ tracks: [], queries: queryList, mood: queryList[0] || '', noResult: true, message: `Pixabay에서 트랙을 찾지 못했습니다. 검색어: ${queryList.join(', ')}` });
-    }
-    res.json({ tracks: tracks.slice(0, 5), queries: queryList, mood: queryList[0] || '' });
+    res.json({
+      tracks:   [],
+      queries:  result.keywords || [],
+      mood:     result.mood || '',
+      reason:   result.reason || '',
+      noResult: true,
+      message:  `추천 키워드: ${(result.keywords||[]).join(', ')} — 아래 무료 음악 사이트에서 검색 후 파일을 업로드하거나 URL을 붙여넣으세요.`
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -2544,7 +3269,7 @@ app.post('/api/media/music-save', async (req, res) => {
     console.log(`[BGM] 저장: "${title}" (${(buf.length/1024).toFixed(0)}KB, vol=${volume})`);
     res.json({ saved: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -2572,7 +3297,7 @@ app.post('/api/media/bgm-upload', express.json({ limit: '64mb' }), (req, res) =>
     console.log(`[BGM] 업로드: "${title}" (${(buf.length/1024).toFixed(0)}KB)`);
     res.json({ saved: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -2588,7 +3313,7 @@ app.post('/api/media/bgm-volume', (req, res) => {
     }
     fs.writeFileSync(pDir(projectId, 'meta.json'), JSON.stringify(meta, null, 2));
     res.json({ updated: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: safeErrMsg(err) }); }
 });
 
 // BGM 삭제
@@ -2604,7 +3329,7 @@ app.post('/api/media/music-delete', (req, res) => {
     fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
     res.json({ deleted: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -2621,7 +3346,7 @@ app.post('/api/shorts/subtitle', (req, res) => {
     fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
     res.json({ shortsSubtitle: meta.shortsSubtitle });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -2738,7 +3463,7 @@ app.post('/api/media/generate-thumbnail', async (req, res) => {
     });
   } catch (err) {
     console.error('[Thumbnail] 오류:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -2762,7 +3487,7 @@ app.post('/api/media/upload-scene-image', (req, res) => {
     console.log(`[Upload] scene_${sceneIndex} 저장: ${(buf.length / 1024).toFixed(0)}KB`);
     res.json({ saved: true, path: `/api/project/${projectId}/images/${fileName}` });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -2972,7 +3697,7 @@ Return ONLY a JSON array, no markdown:
     res.json({ scenes: meta.scenes.map(sc => ({ sceneNumber: sc.sceneNumber, grokEn: sc.grokEn || '', grokKo: sc.grokKo || '' })) });
   } catch (e) {
     console.error('[GROK-PROMPT]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: safeErrMsg(e) });
   }
 });
 
@@ -3071,7 +3796,7 @@ Return ONLY a JSON array, no markdown:
     res.json({ scenes: meta.scenes.map(sc => ({ sceneNumber: sc.sceneNumber, flowPromptEn: sc.flowPromptEn || '', flowPromptKo: sc.flowPromptKo || '' })) });
   } catch (e) {
     console.error('[FLOW-PROMPT-GEN]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: safeErrMsg(e) });
   }
 });
 
@@ -3270,12 +3995,12 @@ Return ONLY a JSON array, no markdown:
 ko: Korean version (same visual meaning, max 200 chars)`;
 
   try {
-    const raw = await geminiText({ apiKey: geminiKey, prompt: `${sysPrompt}\n\nSCENES:\n${sceneList}`, temp: 0.7, model: 'gemini-2.5-flash' });
-    const clean = raw.trim().replace(/^```json\s*/, '').replace(/^```\s*/, '').replace(/\s*```$/, '');
+    const raw = await geminiText({ apiKey: geminiKey, prompt: `${sysPrompt}\n\nSCENES:\n${sceneList}`, temp: 0.7, model: 'gemini-2.5-flash', thinkingBudget: 0 });
+    const clean = raw.trim().replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '');
     let parsed;
     try { parsed = JSON.parse(clean); } catch {
-      const m = clean.match(/\[[\s\S]*\]/);
-      if (!m) throw new Error('Flow 비디오 프롬프트 JSON 파싱 실패');
+      const m = clean.match(/\[[\s\S]*?\]/s);
+      if (!m) throw new Error(`Flow 텍스트→비디오 JSON 파싱 실패 (raw: ${raw.slice(0, 200)})`);
       parsed = JSON.parse(m[0]);
     }
 
@@ -3291,7 +4016,7 @@ ko: Korean version (same visual meaning, max 200 chars)`;
     res.json({ scenes: meta.scenes.map(sc => ({ sceneNumber: sc.sceneNumber, flowVideoEn: sc.flowVideoEn || '', flowVideoKo: sc.flowVideoKo || '' })) });
   } catch (e) {
     console.error('[FLOW-VIDEO-GEN]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: safeErrMsg(e) });
   }
 });
 
@@ -3360,12 +4085,12 @@ Return ONLY a JSON array, no markdown:
 ko: Korean version (same meaning, max 200 chars)`;
 
   try {
-    const raw = await geminiText({ apiKey: geminiKey, prompt: `${sysPrompt}\n\nSCENES:\n${sceneList}`, temp: 0.7, model: 'gemini-2.5-flash' });
-    const clean = raw.trim().replace(/^```json\s*/, '').replace(/^```\s*/, '').replace(/\s*```$/, '');
+    const raw = await geminiText({ apiKey: geminiKey, prompt: `${sysPrompt}\n\nSCENES:\n${sceneList}`, temp: 0.7, model: 'gemini-2.5-flash', thinkingBudget: 0 });
+    const clean = raw.trim().replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '');
     let parsed;
     try { parsed = JSON.parse(clean); } catch {
-      const m = clean.match(/\[[\s\S]*\]/);
-      if (!m) throw new Error('Flow 에셋 비디오 프롬프트 JSON 파싱 실패');
+      const m = clean.match(/\[[\s\S]*?\]/s);
+      if (!m) throw new Error(`Flow 에셋→비디오 JSON 파싱 실패 (raw: ${raw.slice(0, 200)})`);
       parsed = JSON.parse(m[0]);
     }
 
@@ -3381,7 +4106,7 @@ ko: Korean version (same meaning, max 200 chars)`;
     res.json({ scenes: meta.scenes.map(sc => ({ sceneNumber: sc.sceneNumber, flowAssetVideoEn: sc.flowAssetVideoEn || '', flowAssetVideoKo: sc.flowAssetVideoKo || '' })) });
   } catch (e) {
     console.error('[FLOW-ASSET-VIDEO-GEN]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: safeErrMsg(e) });
   }
 });
 
@@ -3513,7 +4238,7 @@ app.post('/api/media/save-image', async (req, res) => {
     fs.writeFileSync(filePath, buf);
     res.json({ saved: true, path: `/api/project/${projectId}/images/${fileName}` });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -3537,7 +4262,7 @@ app.post('/api/media/upload-scene-video', express.json({ limit: '200mb' }), (req
     console.log(`[Video] scene_${sceneIndex} 업로드: ${(buf.length/1024/1024).toFixed(1)}MB`);
     res.json({ saved: true, path: `/api/project/${projectId}/videos/${fileName}` });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -3574,7 +4299,7 @@ app.post('/api/media/bulk-upload-images', express.json({ limit: '200mb' }), (req
 // ─────────────────────────────────────────────────────────────────────────────
 // 일괄 영상 업로드 (Grok 영상 → 장면순 자동 매핑)
 // ─────────────────────────────────────────────────────────────────────────────
-app.post('/api/media/bulk-upload-videos', express.json({ limit: '500mb' }), (req, res) => {
+app.post('/api/media/bulk-upload-videos', express.json({ limit: '150mb' }), (req, res) => {
   const { projectId, files } = req.body;
   // files = [{ sceneIndex, videoData }]
   if (!projectId || !Array.isArray(files) || !files.length)
@@ -3643,24 +4368,32 @@ app.post('/api/media/videos', async (req, res) => {
   } catch (_) {}
 
   try {
-    const r = await fetch(
-      `https://api.pexels.com/videos/search?query=${encodeURIComponent(finalQuery)}&per_page=12&orientation=landscape&size=medium`,
-      { headers: { Authorization: pexelsKey } }
-    );
-    const d = await r.json();
-    if (!r.ok) throw new Error(d?.error || `Pexels 오류 (${r.status})`);
-    const videos = (d.videos || []).map(v => {
-      const file = (v.video_files || [])
-        .filter(f => f.file_type === 'video/mp4')
-        .sort((a, b) => (b.width || 0) - (a.width || 0))
-        .find(f => (f.width || 0) >= 1280)
-        || (v.video_files || []).find(f => f.file_type === 'video/mp4')
-        || v.video_files?.[0];
-      return { id: v.id, duration: v.duration, thumb: v.image, url: file?.link, width: file?.width, user: v.user?.name || '' };
-    }).filter(v => v.url);
+    const searchPexelsVideos = async (q) => {
+      const r = await fetch(
+        `https://api.pexels.com/videos/search?query=${encodeURIComponent(q)}&per_page=12&orientation=landscape&size=medium`,
+        { headers: { Authorization: pexelsKey } }
+      );
+      const d = await r.json();
+      if (!r.ok) throw new Error(d?.error || `Pexels 오류 (${r.status})`);
+      return (d.videos || []).map(v => {
+        const file = (v.video_files || [])
+          .filter(f => f.file_type === 'video/mp4')
+          .sort((a, b) => (b.width || 0) - (a.width || 0))
+          .find(f => (f.width || 0) >= 1280)
+          || (v.video_files || []).find(f => f.file_type === 'video/mp4')
+          || v.video_files?.[0];
+        return { id: v.id, duration: v.duration, thumb: v.image, url: file?.link, width: file?.width, user: v.user?.name || '' };
+      }).filter(v => v.url);
+    };
+    let videos = await searchPexelsVideos(finalQuery);
+    if (videos.length === 0 && finalQuery.includes(' ')) {
+      const simpleQuery = finalQuery.split(' ')[0];
+      console.log(`[Pexels] 영상 0결과 → 단순 쿼리 재시도: "${simpleQuery}"`);
+      videos = await searchPexelsVideos(simpleQuery);
+    }
     res.json({ videos });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -3691,7 +4424,7 @@ app.post('/api/media/save-video', async (req, res) => {
     console.log(`[Video] scene_${sceneIndex} 저장: ${(buf.length / 1024 / 1024).toFixed(1)}MB`);
     res.json({ saved: true, path: `/api/project/${projectId}/videos/${fileName}` });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -3702,6 +4435,36 @@ app.post('/api/render/final', async (req, res) => {
   sseHeaders(res);
   const { projectId, videoRenderMode = 'loop' } = req.body;
   if (!projectId) { sseSend(res, { type: 'error', error: 'projectId 필요' }); return res.end(); }
+
+  if (activeRenders >= MAX_CONCURRENT_RENDERS) {
+    sseSend(res, { type: 'error', error: `현재 렌더링이 ${activeRenders}개 진행 중입니다. 잠시 후 다시 시도해주세요.` });
+    return res.end();
+  }
+  activeRenders++;
+
+  // 취소 컨텍스트 — renderJobs에 등록, ffmpeg cmd는 실행 시점에 삽입
+  const job = { cmd: null, cancelled: false };
+  renderJobs.set(projectId, job);
+
+  // SSE 클라이언트 연결 끊김 감지 → 취소 처리
+  res.on('close', () => {
+    if (job && !job.cancelled) {
+      job.cancelled = true;
+      if (job.cmd) { try { job.cmd.kill('SIGKILL'); } catch (_) {} }
+    }
+  });
+
+  // ffmpeg 실행 헬퍼 — 취소 감지 + job.cmd 등록
+  const runFfmpegJob = (builder) => new Promise((resolve, reject) => {
+    if (job.cancelled) return reject(new Error('렌더가 취소됐습니다'));
+    const cmd = builder();
+    job.cmd = cmd;
+    cmd.on('end', () => { job.cmd = null; resolve(); })
+       .on('error', (e) => { job.cmd = null; reject(e); })
+       .run();
+  });
+
+  const renderKeepalive = setInterval(() => { try { res.write(': ping\n\n'); } catch(_) {} }, 10_000);
 
   sseSend(res, { type: 'progress', pct: 3, msg: '렌더 준비 중…' });
 
@@ -3719,6 +4482,39 @@ app.post('/api/render/final', async (req, res) => {
   const VW = isShorts ? 1080 : 1920;
   const VH = isShorts ? 1920 : 1080;
   const scaleFilter = `scale=${VW}:${VH}:force_original_aspect_ratio=decrease,pad=${VW}:${VH}:(ow-iw)/2:(oh-ih)/2`;
+
+  // ── 정보성 콘텐츠 텍스트 오버레이 설정 ─────────────────────────────────────────
+  const isInfoRender = detectInfoContent(meta);
+  const FONT_PATH = process.env.FONT_PATH
+    || (fs.existsSync('C:/Windows/Fonts/malgun.ttf') ? 'C:/Windows/Fonts/malgun.ttf' : null)
+    || (fs.existsSync('/usr/share/fonts/truetype/nanum/NanumGothic.ttf') ? '/usr/share/fonts/truetype/nanum/NanumGothic.ttf' : null)
+    || (fs.existsSync('/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc') ? '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc' : null)
+    || (fs.existsSync(path.join(__dirname, 'fonts', 'malgun.ttf')) ? path.join(__dirname, 'fonts', 'malgun.ttf') : null)
+    || '';
+  const hasFontFile = !!FONT_PATH && fs.existsSync(FONT_PATH);
+  // 장면번호 → infoOverlay 맵 (렌더 시 빠른 조회용)
+  const infoOverlayMap = {};
+  if (isInfoRender && hasFontFile && meta.scenes) {
+    meta.scenes.forEach(sc => {
+      if (sc.infoOverlay) infoOverlayMap[sc.sceneNumber] = sc.infoOverlay;
+    });
+    console.log(`[Render] infoOverlay 적용 가능: ${Object.keys(infoOverlayMap).length}개 장면, 폰트: ${FONT_PATH}`);
+  } else if (isInfoRender && !hasFontFile) {
+    sseSend(res, { type: 'warning', message: '⚠️ 한국어 폰트를 찾을 수 없어 기관정보 자막 오버레이가 비활성화됩니다. FONT_PATH 환경변수 또는 fonts/malgun.ttf 파일을 추가하세요.' });
+    console.warn('[Render] 정보성 콘텐츠이나 폰트 없음 → infoOverlay 비활성화');
+  }
+  // drawtext 필터 문자열 생성 (FFmpeg 특수문자 이스케이프)
+  const makeInfoDrawtext = (text) => {
+    if (!text || !hasFontFile) return '';
+    const safe = text
+      .replace(/\\/g, '/')
+      .replace(/'/g, '')
+      .replace(/:/g, '\\:')
+      .replace(/\[/g, '\\[').replace(/\]/g, '\\]');
+    const fontSize = isShorts ? 34 : 30;
+    const padY     = isShorts ? 50 : 30;
+    return `drawtext=fontfile='${FONT_PATH.replace(/\\/g,'/')}':text='${safe}':fontcolor=white:fontsize=${fontSize}:box=1:boxcolor=0x000000@0.72:boxborderw=14:x=30:y=h-th-${padY}:line_spacing=4`;
+  };
   const audioDir = pDir(projectId, 'audio');
 
   // audio_full.wav 없거나 손상(< 1KB)이면 세그먼트 파일로 자동 재조립
@@ -3743,21 +4539,21 @@ app.post('/api/render/final', async (req, res) => {
     const listContent = segFiles.map(f => `file '${f.replace(/\\/g, '/')}'`).join('\n');
     fs.writeFileSync(listFile, listContent);
 
-    await new Promise((resolve, reject) => {
+    await runFfmpegJob(() =>
       ffmpeg()
         .input(listFile)
         .inputOptions(['-f', 'concat', '-safe', '0'])
         .outputOptions(['-af', 'dynaudnorm=f=500:g=31:r=0.9,loudnorm=I=-16:LRA=7:TP=-1.5', '-c:a', 'pcm_s16le', '-ar', '24000', '-ac', '1'])
         .output(audioPath)
-        .on('end', resolve)
-        .on('error', (e) => {
-          // fallback: loudnorm만
-          ffmpeg()
-            .input(listFile).inputOptions(['-f', 'concat', '-safe', '0'])
-            .outputOptions(['-af', 'loudnorm=I=-16:LRA=11:TP=-1.5', '-c:a', 'pcm_s16le', '-ar', '24000', '-ac', '1'])
-            .output(audioPath).on('end', resolve).on('error', reject).run();
-        })
-        .run();
+    ).catch(async (e) => {
+      if (job.cancelled || e.message === '렌더가 취소됐습니다') throw e;
+      // fallback: loudnorm만
+      await runFfmpegJob(() =>
+        ffmpeg()
+          .input(listFile).inputOptions(['-f', 'concat', '-safe', '0'])
+          .outputOptions(['-af', 'loudnorm=I=-16:LRA=11:TP=-1.5', '-c:a', 'pcm_s16le', '-ar', '24000', '-ac', '1'])
+          .output(audioPath)
+      );
     });
     console.log('[Render] 재조립 완료 →', audioPath);
   }
@@ -3833,7 +4629,7 @@ app.post('/api/render/final', async (req, res) => {
       // 미디어 없음 → 검은 화면 + 오디오 (+ BGM 있으면 믹싱)
       sseSend(res, { type: 'progress', pct: 30, msg: '미디어 없음 — 검은 화면으로 렌더링 중…' });
       console.log('[Render] 미디어 없음 → 검은 화면');
-      await new Promise((resolve, reject) => {
+      await runFfmpegJob(() => {
         let cmd = ffmpeg()
           .input(`color=black:s=${VW}x${VH}:r=1`)
           .inputOptions(['-f', 'lavfi', '-t', durStr])
@@ -3856,7 +4652,7 @@ app.post('/api/render/final', async (req, res) => {
           cmd.outputOptions(['-c:v', 'libx264', '-c:a', 'aac', '-t', durStr, '-pix_fmt', 'yuv420p']);
         }
 
-        cmd.output(finalPath).on('end', resolve).on('error', reject).run();
+        return cmd.output(finalPath);
       });
 
     } else {
@@ -3872,58 +4668,68 @@ app.post('/api/render/final', async (req, res) => {
 
       const PRESET = 'ultrafast'; // 중간 클립은 빠르게 (최종 합성 때 재인코딩됨)
 
-      const makeVidClip = (src, outPath, dur) => new Promise((resolve, reject) => {
-        ffmpeg()
+      const makeVidClip = (src, outPath, dur, overlayText = '') => runFfmpegJob(() => {
+        const dt  = makeInfoDrawtext(overlayText);
+        const vf  = dt ? `${scaleFilter},fps=25,${dt}` : `${scaleFilter},fps=25`;
+        return ffmpeg()
           .input(src).inputOptions(['-t', dur.toFixed(3)])
           .outputOptions([
-            '-vf', `${scaleFilter},fps=25`,
+            '-vf', vf,
             '-c:v', 'libx264', '-crf', '23', '-preset', PRESET, '-an', '-pix_fmt', 'yuv420p'
           ])
-          .output(outPath).on('end', resolve).on('error', reject).run();
+          .output(outPath);
       });
 
-      const makeImgClip = (src, outPath, dur) => new Promise((resolve, reject) => {
-        ffmpeg()
+      const makeImgClip = (src, outPath, dur, overlayText = '') => runFfmpegJob(() => {
+        const dt  = makeInfoDrawtext(overlayText);
+        const vf  = dt ? `${scaleFilter},fps=25,${dt}` : `${scaleFilter},fps=25`;
+        return ffmpeg()
           .input(src).inputOptions(['-loop', '1', '-t', dur.toFixed(3)])
           .outputOptions([
-            '-vf', `${scaleFilter},fps=25`,
+            '-vf', vf,
             '-c:v', 'libx264', '-crf', '23', '-preset', PRESET, '-an', '-pix_fmt', 'yuv420p',
             '-t', dur.toFixed(3)
           ])
-          .output(outPath).on('end', resolve).on('error', reject).run();
+          .output(outPath);
       });
 
       // ── 루프 모드: 영상 클립을 장면 전체 시간 동안 반복 재생 ─────────────────
-      const makeLoopVidClip = (src, outPath, dur) => new Promise((resolve, reject) => {
-        ffmpeg()
+      const makeLoopVidClip = (src, outPath, dur, overlayText = '') => runFfmpegJob(() => {
+        const dt  = makeInfoDrawtext(overlayText);
+        const vf  = dt ? `${scaleFilter},fps=25,${dt}` : `${scaleFilter},fps=25`;
+        return ffmpeg()
           .input(src).inputOptions(['-stream_loop', '-1', '-t', dur.toFixed(3)])
           .outputOptions([
-            '-vf', `${scaleFilter},fps=25`,
+            '-vf', vf,
             '-c:v', 'libx264', '-crf', '23', '-preset', PRESET, '-an', '-pix_fmt', 'yuv420p',
             '-t', dur.toFixed(3)
           ])
-          .output(outPath).on('end', resolve).on('error', reject).run();
+          .output(outPath);
       });
 
       // ── 검은 화면 클립 (이미지 없는 장면용) ──────────────────────────────────
-      const makeBlackClip = (outPath, dur) => new Promise((resolve, reject) => {
-        ffmpeg()
+      const makeBlackClip = (outPath, dur, overlayText = '') => runFfmpegJob(() => {
+        const dt      = makeInfoDrawtext(overlayText);
+        const baseVF  = `${scaleFilter},fps=25`;
+        const filters = dt ? [`${baseVF},${dt}`] : [baseVF];
+        return ffmpeg()
           .input(`color=black:s=${VW}x${VH}:r=25`)
           .inputOptions(['-f', 'lavfi', '-t', dur.toFixed(3)])
           .outputOptions([
+            '-vf', filters[0],
             '-c:v', 'libx264', '-crf', '23', '-preset', PRESET, '-an', '-pix_fmt', 'yuv420p',
             '-t', dur.toFixed(3)
           ])
-          .output(outPath).on('end', resolve).on('error', reject).run();
+          .output(outPath);
       });
 
       // ── 오버레이 1회 모드: 이미지 배경 + 영상 클립 1회 재생 → 나머지 이미지 ──
-      const makeOverlayOnceClip = (imgSrc, vidSrc, outPath, dur) => new Promise((resolve, reject) => {
-        const overlayFilter =
-          `[0:v]${scaleFilter}[bg];` +
-          `[1:v]${scaleFilter}[fg];` +
-          '[bg][fg]overlay=0:0';
-        ffmpeg()
+      const makeOverlayOnceClip = (imgSrc, vidSrc, outPath, dur, overlayText = '') => runFfmpegJob(() => {
+        const dt = makeInfoDrawtext(overlayText);
+        const overlayFilter = dt
+          ? `[0:v]${scaleFilter}[bg];[1:v]${scaleFilter}[fg];[bg][fg]overlay=0:0[combined];[combined]${dt}`
+          : `[0:v]${scaleFilter}[bg];[1:v]${scaleFilter}[fg];[bg][fg]overlay=0:0`;
+        return ffmpeg()
           .input(imgSrc).inputOptions(['-loop', '1', '-t', dur.toFixed(3)])
           .input(vidSrc)
           .outputOptions([
@@ -3931,7 +4737,7 @@ app.post('/api/render/final', async (req, res) => {
             '-c:v', 'libx264', '-crf', '23', '-preset', PRESET, '-an', '-pix_fmt', 'yuv420p',
             '-t', dur.toFixed(3)
           ])
-          .output(outPath).on('end', resolve).on('error', reject).run();
+          .output(outPath);
       });
 
       sseSend(res, { type: 'progress', pct: 15, msg: `장면 클립 생성 시작 (총 ${allNums.length}장면)` });
@@ -3945,12 +4751,13 @@ app.post('/api/render/final', async (req, res) => {
       for (let b = 0; b < lastIdx; b += PARALLEL) {
         const batch = allNums.slice(b, Math.min(b + PARALLEL, lastIdx));
         await Promise.all(batch.map(async (num, bi) => {
-          const i       = b + bi;
-          const pfx     = `clip_${String(i).padStart(3, '0')}`;
-          const hasVid  = !!vidMap[num];
-          const hasImg  = !!imgMap[num];
-          const clipDur = segDuration;
-          const clipPct = 15 + Math.round(((b + bi + 1) / allNums.length) * 55);
+          const i           = b + bi;
+          const pfx         = `clip_${String(i).padStart(3, '0')}`;
+          const hasVid      = !!vidMap[num];
+          const hasImg      = !!imgMap[num];
+          const clipDur     = segDuration;
+          const clipPct     = 15 + Math.round(((b + bi + 1) / allNums.length) * 55);
+          const overlayText = infoOverlayMap[num] || '';
           sseSend(res, { type: 'progress', pct: clipPct, msg: `장면 ${i + 1}/${allNums.length} 처리 중… (scene_${num})` });
 
           if (hasVid && hasImg) {
@@ -3958,24 +4765,24 @@ app.post('/api/render/final', async (req, res) => {
             const imgSrc  = path.join(imgDir,   imgMap[num]);
             const clipPath = path.join(procDir, `${pfx}.mp4`);
             if (videoRenderMode === 'loop') {
-              await makeLoopVidClip(vidSrc, clipPath, clipDur);
+              await makeLoopVidClip(vidSrc, clipPath, clipDur, overlayText);
             } else {
-              await makeOverlayOnceClip(imgSrc, vidSrc, clipPath, clipDur);
+              await makeOverlayOnceClip(imgSrc, vidSrc, clipPath, clipDur, overlayText);
             }
             clipMap[i] = [clipPath];
           } else if (hasVid) {
             const clipPath = path.join(procDir, `${pfx}.mp4`);
             const src = path.join(videoDir, vidMap[num]);
             if (videoRenderMode === 'loop') {
-              await makeLoopVidClip(src, clipPath, clipDur);
+              await makeLoopVidClip(src, clipPath, clipDur, overlayText);
             } else {
-              await makeVidClip(src, clipPath, clipDur);
+              await makeVidClip(src, clipPath, clipDur, overlayText);
             }
             clipMap[i] = [clipPath];
           } else if (hasImg) {
             const clipPath = path.join(procDir, `${pfx}.mp4`);
             const src = path.join(imgDir, imgMap[num]);
-            await makeImgClip(src, clipPath, clipDur);
+            await makeImgClip(src, clipPath, clipDur, overlayText);
             clipMap[i] = [clipPath];
           } else {
             clipMap[i] = []; // 미디어 없음
@@ -3985,12 +4792,13 @@ app.post('/api/render/final', async (req, res) => {
 
       // 마지막 장면 처리 (별도 — 특수 로직 있음)
       if (allNums.length > 0) {
-        const i      = lastIdx;
-        const num    = allNums[i];
-        const pfx    = `clip_${String(i).padStart(3, '0')}`;
-        const hasVid = !!vidMap[num];
-        const hasImg = !!imgMap[num];
-        const clipDur = segDuration + 0.5;
+        const i           = lastIdx;
+        const num         = allNums[i];
+        const pfx         = `clip_${String(i).padStart(3, '0')}`;
+        const hasVid      = !!vidMap[num];
+        const hasImg      = !!imgMap[num];
+        const clipDur     = segDuration + 0.5;
+        const overlayText = infoOverlayMap[num] || '';
         sseSend(res, { type: 'progress', pct: 70, msg: `마지막 장면 처리 중… (scene_${num})` });
 
         if (hasVid) {
@@ -3998,16 +4806,16 @@ app.post('/api/render/final', async (req, res) => {
           const actualVidDur = await getVideoDuration(vidSrc);
           const imgClipPath  = path.join(procDir, `${pfx}_a.mp4`);
           if (hasImg) {
-            await makeImgClip(path.join(imgDir, imgMap[num]), imgClipPath, clipDur);
+            await makeImgClip(path.join(imgDir, imgMap[num]), imgClipPath, clipDur, overlayText);
           } else {
-            await makeBlackClip(imgClipPath, clipDur);
+            await makeBlackClip(imgClipPath, clipDur, overlayText);
           }
           const vidClipPath = path.join(procDir, `${pfx}_b.mp4`);
-          await makeVidClip(vidSrc, vidClipPath, actualVidDur);
+          await makeVidClip(vidSrc, vidClipPath, actualVidDur, overlayText);
           clipMap[i] = [imgClipPath, vidClipPath];
         } else if (hasImg) {
           const clipPath = path.join(procDir, `${pfx}.mp4`);
-          await makeImgClip(path.join(imgDir, imgMap[num]), clipPath, clipDur);
+          await makeImgClip(path.join(imgDir, imgMap[num]), clipPath, clipDur, overlayText);
           clipMap[i] = [clipPath];
         } else {
           clipMap[i] = [];
@@ -4039,7 +4847,7 @@ app.post('/api/render/final', async (req, res) => {
         sseSend(res, { type: 'progress', pct: 75, msg: '오디오 합성 중…' });
       }
 
-      const runFinalCmd = (withBgm) => new Promise((resolve, reject) => {
+      const runFinalCmd = (withBgm) => runFfmpegJob(() => {
         let cmd = ffmpeg()
           .input(concatTxt).inputOptions(['-f', 'concat', '-safe', '0'])
           .input(audioPath);
@@ -4065,7 +4873,7 @@ app.post('/api/render/final', async (req, res) => {
           ]);
         }
 
-        cmd.output(finalPath).on('end', resolve).on('error', reject).run();
+        return cmd.output(finalPath);
       });
 
       if (hasBgm) {
@@ -4108,12 +4916,19 @@ app.post('/api/render/final', async (req, res) => {
         if (ivDur <= 0) { console.log(`[Interview] scene_${iv.sceneNumber} duration=0 → 건너뜀`); continue; }
 
         // 삽입 위치: 해당 씬 시작 직전
-        const sceneIdx   = (allNums || []).indexOf(iv.sceneNumber);
-        if (sceneIdx < 0) { console.log(`[Interview] scene_${iv.sceneNumber} 씬 목록 미포함 → 건너뜀`); continue; }
+        const sceneIdx = (allNums || []).indexOf(iv.sceneNumber);
+        let estimatedIdx = sceneIdx;
+        if (sceneIdx < 0) {
+          // 씬 목록에 없으면 sceneNumber 비율로 삽입 위치 추정 (마지막 씬 번호 대비)
+          const maxSceneNum = Math.max(...(allNums || [0]), iv.sceneNumber);
+          estimatedIdx = Math.round((iv.sceneNumber / maxSceneNum) * ((allNums || []).length - 1));
+          console.log(`[Interview] scene_${iv.sceneNumber} 씬 목록 미포함 → 추정 위치 idx=${estimatedIdx} 사용`);
+          if (estimatedIdx < 0) { console.log(`[Interview] scene_${iv.sceneNumber} 추정 실패 → 건너뜀`); continue; }
+        }
 
         // 메인 영상의 현재 실제 길이 다시 측정 (이전 splice로 늘어났을 수 있음)
         const mainDur    = await getVideoDuration(currentFile);
-        const insertTime = Math.min(sceneIdx * segDur + timeOffset, mainDur - 0.1);
+        const insertTime = Math.min(estimatedIdx * segDur + timeOffset, mainDur - 0.1);
         if (insertTime < 0) { console.log(`[Interview] scene_${iv.sceneNumber} insertTime=${insertTime.toFixed(2)}s 음수 → 0으로 보정`); }
         const safeInsert = Math.max(insertTime, 0);
 
@@ -4165,7 +4980,7 @@ app.post('/api/render/final', async (req, res) => {
             resolve({ hasAudio });
           });
         });
-        await new Promise((resolve, reject) => {
+        await runFfmpegJob(() => {
           const cmd = ffmpeg().input(srcPath);
           const outputOpts = [
             '-vf', `scale=${VW}:${VH}:force_original_aspect_ratio=decrease,pad=${VW}:${VH}:(ow-iw)/2:(oh-ih)/2`,
@@ -4175,22 +4990,17 @@ app.post('/api/render/final', async (req, res) => {
           if (srcInfo.hasAudio) {
             outputOpts.push('-map', '0:v', '-map', '0:a');
           } else {
-            // 오디오 없는 영상 → 무음 트랙 삽입 후 concat 스펙 통일
             cmd.input('anullsrc=r=44100:cl=stereo').inputOptions(['-f', 'lavfi']);
             outputOpts.push('-map', '0:v', '-map', '1:a', '-shortest');
           }
-          cmd.outputOptions(outputOpts)
-            .output(outPath)
-            .on('end', resolve)
-            .on('error', reject)
-            .run();
+          return cmd.outputOptions(outputOpts).output(outPath);
         });
         return outPath;
       };
 
       // 메인 영상도 동일 스펙으로 재인코딩 (concat 스펙 통일)
       const mainNormPath = path.join(procDir3, 'main_norm.mp4');
-      await new Promise((resolve, reject) => {
+      await runFfmpegJob(() =>
         ffmpeg()
           .input(finalPath)
           .outputOptions([
@@ -4198,10 +5008,7 @@ app.post('/api/render/final', async (req, res) => {
             '-c:a', 'aac', '-ar', '44100', '-ac', '2',
           ])
           .output(mainNormPath)
-          .on('end', resolve)
-          .on('error', reject)
-          .run();
-      });
+      );
 
       // concat 파일 구성
       const concatParts = [];
@@ -4213,53 +5020,20 @@ app.post('/api/render/final', async (req, res) => {
       fs.writeFileSync(bookendConcat, concatParts.map(f => `file '${f.replace(/\\/g, '/')}'`).join('\n'));
 
       const bookendOut = path.join(procDir3, 'bookend_final.mp4');
-      await new Promise((resolve, reject) => {
+      await runFfmpegJob(() =>
         ffmpeg()
           .input(bookendConcat)
           .inputOptions(['-f', 'concat', '-safe', '0'])
-          .outputOptions(['-c', 'copy'])  // 스펙 통일 후 스트림 복사
+          .outputOptions(['-c', 'copy'])
           .output(bookendOut)
-          .on('end', resolve)
-          .on('error', reject)
-          .run();
-      });
+      );
 
       fs.copyFileSync(bookendOut, finalPath);
       console.log(`[Bookend] 완료 → ${hasIntro ? '인트로+' : ''}본편${hasOutro ? '+아웃트로' : ''}`);
     }
 
-    // ── BGM 믹싱 ─────────────────────────────────────────────────────────────
-    const bgmPath   = meta.bgm?.path ? path.join(PROJECTS_DIR, projectId, meta.bgm.path.replace(/^.*projects\/[^/]+\//, '')) : null;
-    const bgmVolume = meta.bgm?.volume ?? 0.15; // 기본 15%
-    if (bgmPath && fs.existsSync(bgmPath)) {
-      sseSend(res, { type: 'progress', pct: 96, msg: 'BGM 믹싱 중…' });
-      const bgmOut = path.join(finalDir, 'final_bgm.mp4');
-      try {
-        const finalDuration = await getVideoDuration(finalPath);
-      await new Promise((resolve, reject) => {
-          ffmpeg()
-            .input(finalPath)
-            .input(bgmPath)
-            .complexFilter([
-              // BGM을 영상 길이에 맞게 루프 처리 + 볼륨 조절
-              `[1:a]aloop=loop=-1:size=2e+09,atrim=duration=${finalDuration},volume=${bgmVolume}[bgm]`,
-              `[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[aout]`
-            ])
-            .outputOptions([
-              '-map', '0:v', '-map', '[aout]',
-              '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k'
-            ])
-            .output(bgmOut)
-            .on('end', resolve)
-            .on('error', reject)
-            .run();
-        });
-        fs.copyFileSync(bgmOut, finalPath);
-        console.log(`[BGM] 믹싱 완료 (볼륨: ${Math.round(bgmVolume * 100)}%)`);
-      } catch (e) {
-        console.log('[BGM] 믹싱 실패 (BGM 없이 계속):', e.message);
-      }
-    }
+    // ── BGM 믹싱은 위 runFinalCmd(true) 단계에서 이미 처리됨 ──────────────────
+    // (hasBgmGlobal 기반으로 완료 — 여기서 재믹싱하면 BGM이 두 번 적용되는 버그 발생)
 
     const renderMode = Object.keys(vidMap).length > 0 && Object.keys(imgMap).length > 0 ? 'mixed'
       : Object.keys(vidMap).length > 0 ? 'video'
@@ -4270,9 +5044,18 @@ app.post('/api/render/final', async (req, res) => {
     fs.writeFileSync(pDir(projectId, 'meta.json'), JSON.stringify(meta, null, 2));
 
     sseSend(res, { type: 'done', url: `/api/project/${projectId}/final/final.mp4`, status: 'done', mode: renderMode, isShorts });
+    clearInterval(renderKeepalive);
+    activeRenders--;
+    renderJobs.delete(projectId);
+    try { fs.rmSync(path.join(finalDir, '_proc'), { recursive: true, force: true }); } catch (_) {}
     res.end();
   } catch (err) {
-    sseSend(res, { type: 'error', error: err.message });
+    const isCancelled = job.cancelled || err.message === '렌더가 취소됐습니다';
+    sseSend(res, { type: isCancelled ? 'cancelled' : 'error', error: isCancelled ? '렌더링이 취소됐습니다.' : safeErrMsg(err) });
+    clearInterval(renderKeepalive);
+    activeRenders--;
+    renderJobs.delete(projectId);
+    try { fs.rmSync(path.join(finalDir, '_proc'), { recursive: true, force: true }); } catch (_) {}
     res.end();
   }
 });
@@ -4407,6 +5190,20 @@ app.post('/api/pipeline/auto', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 렌더 취소
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/api/render/cancel/:projectId', (req, res) => {
+  const { projectId } = req.params;
+  const job = renderJobs.get(projectId);
+  if (!job) return res.json({ ok: false, message: '진행 중인 렌더가 없습니다.' });
+  job.cancelled = true;
+  if (job.cmd) {
+    try { job.cmd.kill('SIGKILL'); } catch (_) {}
+  }
+  res.json({ ok: true, message: '렌더 취소 요청을 보냈습니다.' });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 인물 이미지 분석 → 한국어 + 영어 외모 설명 추출
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/character/extract', async (req, res) => {
@@ -4457,7 +5254,7 @@ CharacterName (or Person1): age range, body type, face shape, hair (color, lengt
     if (!korean && !english) throw new Error('인물 외모 추출 실패 — 인물이 포함된 이미지인지 확인하세요');
     res.json({ korean, english });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -4501,8 +5298,8 @@ app.get('/api/projects/list', (req, res) => {
       };
     } catch { return null; }
   }).filter(Boolean).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  const longform = projects.filter(p => !p.isShorts).slice(0, 30);
-  const shorts   = projects.filter(p =>  p.isShorts).slice(0, 30);
+  const longform = projects.filter(p => !p.isShorts).slice(0, 50); // 기존 30 → 50으로 확장
+  const shorts   = projects.filter(p =>  p.isShorts).slice(0, 50);
   res.json({ projects: [...longform, ...shorts], all: projects });
 });
 
@@ -4580,7 +5377,7 @@ app.post('/api/bgm/suggest', async (req, res) => {
     const clean = raw.trim().replace(/^```json\s*/,'').replace(/\s*```$/,'').replace(/^```\s*/,'');
     res.json(JSON.parse(clean));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -4706,7 +5503,7 @@ ${Array.from({length:count},(_,i)=>`EP${i+1}:\n주제: (${i+1}화 구체적 주�
     if (episodes.length < 2) return res.status(500).json({ error: 'AI가 주제를 생성하지 못했습니다. 다시 시도하세요.' });
     res.json({ episodes });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -4788,8 +5585,8 @@ app.post('/api/series/batch', async (req, res) => {
       results.push({ episode: ep.episode, topic: ep.topic, projectId, ok: true });
       send({ type: 'done', episode: ep.episode, projectId, topic: ep.topic });
     } catch (err) {
-      results.push({ episode: ep.episode, topic: ep.topic, ok: false, error: err.message });
-      send({ type: 'error', episode: ep.episode, projectId, error: err.message });
+      results.push({ episode: ep.episode, topic: ep.topic, ok: false, error: safeErrMsg(err) });
+      send({ type: 'error', episode: ep.episode, projectId, error: safeErrMsg(err) });
     }
   }
   send({ type: 'complete', results });
@@ -4854,7 +5651,7 @@ ${scriptSnippet}
     }
     res.json(parsed);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeErrMsg(err) });
   }
 });
 
@@ -4878,17 +5675,17 @@ app.get('/api/project/:id/srt', (req, res) => {
       const srt = buildSRTFromTtsSegments(segs, totalDur);
       const topic = meta.topic || id;
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(topic)}.srt"`);
-      return res.send('﻿' + srt);
+      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(topic)}.srt`);
+      return res.send(srt);
     } catch (e) {
-      return res.status(500).json({ error: e.message });
+      return res.status(500).json({ error: safeErrMsg(e) });
     }
   }
 
   const meta = (() => { try { return JSON.parse(fs.readFileSync(pDir(id, 'meta.json'), 'utf8')); } catch(_){ return {}; } })();
   const topic = meta.topic || id;
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(topic)}.srt"`);
+  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(topic)}.srt`);
   res.sendFile(srtPath);
 });
 
@@ -4908,7 +5705,7 @@ app.post('/api/project/:id/submit', (req, res) => {
     console.log(`[Submit] ${id} → uploadedAt=${meta.uploadedAt}`);
     res.json({ ok: true, uploadedAt: meta.uploadedAt });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: safeErrMsg(e) });
   }
 });
 
@@ -4925,7 +5722,7 @@ app.post('/api/project/:id/delete', (req, res) => {
     console.log(`[Project] 삭제: ${id}`);
     res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: '삭제 실패: ' + e.message });
+    res.status(500).json({ error: '삭제 실패: ' + safeErrMsg(e) });
   }
 });
 
@@ -4970,7 +5767,7 @@ app.post('/api/tts/retry-segment', async (req, res) => {
     res.json({ ok: true, index: segIndex + 1, duration, durationFmt: fmtSec(duration),
       url: `/api/project/${projectId}/audio/${fileName}`, fileName });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: safeErrMsg(e) });
   }
 });
 
@@ -5011,7 +5808,7 @@ app.post('/api/project/:id/clone', (req, res) => {
     console.log(`[Project] 클론: ${id} → ${newId}`);
     res.json({ ok: true, newId });
   } catch (e) {
-    res.status(500).json({ error: '클론 실패: ' + e.message });
+    res.status(500).json({ error: '클론 실패: ' + safeErrMsg(e) });
   }
 });
 
@@ -5112,7 +5909,7 @@ app.get('/api/project/:id/load', (req, res) => {
 
     res.json({ meta, script, scenes: meta.scenes || [], tts: meta.tts || null, images, videos, finalVideo: meta.finalVideo || null });
   } catch (e) {
-    res.status(500).json({ error: '프로젝트 데이터 읽기 오류: ' + e.message });
+    res.status(500).json({ error: '프로젝트 데이터 읽기 오류: ' + safeErrMsg(e) });
   }
 });
 
@@ -5120,8 +5917,8 @@ app.get('/api/project/:id/load', (req, res) => {
 // 파일 서빙 / 다운로드
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/project/:id/audio/:file', (req, res) => {
-  const fp = pDir(req.params.id, 'audio', req.params.file);
-  if (!fs.existsSync(fp)) return res.status(404).end();
+  const fp = safeFilePath(PROJECTS_DIR, req.params.id, 'audio', req.params.file);
+  if (!fp || !fs.existsSync(fp)) return res.status(404).end();
   // stream for playback (range support) or download
   const dl = req.query.download === '1';
   if (dl) return res.download(fp);
@@ -5153,30 +5950,30 @@ app.get('/api/project/:id/images/download-zip', (req, res) => {
 });
 
 app.get('/api/project/:id/images/:file', (req, res) => {
-  const fp = pDir(req.params.id, 'images', req.params.file);
-  if (!fs.existsSync(fp)) return res.status(404).end();
+  const fp = safeFilePath(PROJECTS_DIR, req.params.id, 'images', req.params.file);
+  if (!fp || !fs.existsSync(fp)) return res.status(404).end();
   if (req.query.download === '1') return res.download(fp);
   res.sendFile(fp);
 });
 
 app.get('/api/project/:id/videos/:file', (req, res) => {
-  const fp = pDir(req.params.id, 'videos', req.params.file);
-  if (!fs.existsSync(fp)) return res.status(404).end();
+  const fp = safeFilePath(PROJECTS_DIR, req.params.id, 'videos', req.params.file);
+  if (!fp || !fs.existsSync(fp)) return res.status(404).end();
   if (req.query.download === '1') return res.download(fp);
   res.sendFile(fp);
 });
 
 app.get('/api/project/:id/bgm/:file', (req, res) => {
-  const fp = pDir(req.params.id, 'bgm', req.params.file);
-  if (!fs.existsSync(fp)) return res.status(404).end();
+  const fp = safeFilePath(PROJECTS_DIR, req.params.id, 'bgm', req.params.file);
+  if (!fp || !fs.existsSync(fp)) return res.status(404).end();
   res.setHeader('Content-Type', 'audio/mpeg');
   res.setHeader('Accept-Ranges', 'bytes');
   res.sendFile(fp);
 });
 
 app.get('/api/project/:id/final/:file', (req, res) => {
-  const fp = pDir(req.params.id, 'final', req.params.file);
-  if (!fs.existsSync(fp)) return res.status(404).end();
+  const fp = safeFilePath(PROJECTS_DIR, req.params.id, 'final', req.params.file);
+  if (!fp || !fs.existsSync(fp)) return res.status(404).end();
   res.download(fp);
 });
 
@@ -5185,7 +5982,7 @@ app.get('/api/youtube/auth-url', (req, res) => {
   try {
     res.json({ url: getAuthUrl() });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: safeErrMsg(e) });
   }
 });
 
@@ -5203,7 +6000,7 @@ app.get('/api/youtube/callback', async (req, res) => {
       <script>setTimeout(()=>window.close(),2000)</script>
     </body></html>`);
   } catch (e) {
-    res.status(500).send('인증 실패: ' + e.message);
+    res.status(500).send('인증 실패');
   }
 });
 
@@ -5216,7 +6013,7 @@ app.post('/api/youtube/auth-token', async (req, res) => {
     fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2));
     res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: safeErrMsg(e) });
   }
 });
 
@@ -5269,11 +6066,44 @@ app.post('/api/project/:id/youtube-upload', async (req, res) => {
     res.json({ ok: true, videoId, videoUrl });
   } catch (e) {
     console.error('[YouTube Upload]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: safeErrMsg(e) });
   }
 });
 
+// 전역 에러 핸들러 — 처리되지 않은 예외가 프로세스를 죽이지 않도록
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason instanceof Error ? reason.message : String(reason));
+});
+
+// Express 전역 에러 미들웨어 (next(err) 로 전달된 에러 처리)
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error('[Express 전역 에러]', err.message);
+  if (res.headersSent) return;
+  res.status(500).json({ error: safeErrMsg(err) });
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n롱폼 자동화 v2 — http://localhost:${PORT}\n`);
+  // Railway 배포 환경 점검
+  if (process.env.RAILWAY_PUBLIC_DOMAIN) {
+    const volumeOk = !!process.env.RAILWAY_VOLUME_MOUNT_PATH;
+    const fontOk   = (() => {
+      const candidates = [
+        process.env.FONT_PATH,
+        'C:/Windows/Fonts/malgun.ttf',
+        '/usr/share/fonts/truetype/nanum/NanumGothic.ttf',
+        '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
+        path.join(__dirname, 'fonts', 'malgun.ttf'),
+      ].filter(Boolean);
+      return candidates.some(p => { try { return require('fs').existsSync(p); } catch(_){ return false; } });
+    })();
+    console.log('[Railway] 환경 점검:');
+    console.log(`  Volume: ${volumeOk ? '✅ ' + process.env.RAILWAY_VOLUME_MOUNT_PATH : '❌ RAILWAY_VOLUME_MOUNT_PATH 미설정 — 재배포 시 데이터 소실'}`);
+    console.log(`  Font:   ${fontOk   ? '✅ 한국어 폰트 확인됨' : '⚠️  한국어 폰트 없음 — 정보성 영상 자막 오버레이 비활성화됨'}`);
+  }
 });

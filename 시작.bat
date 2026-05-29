@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 chcp 65001 > nul
 echo.
 echo ========================================
@@ -14,7 +14,7 @@ if not exist "node_modules" (
     exit /b 1
 )
 
-start /b cmd /c "timeout /t 2 /nobreak >nul && start http://localhost:5500"
+start "" /b cmd /c "timeout /t 2 /nobreak >nul && start http://localhost:5500"
 
 echo  서버 시작 중... 잠시 후 브라우저가 열립니다.
 echo  종료: 이 창을 닫거나 Ctrl+C

@@ -3,6 +3,9 @@
   "version": "2.0.0",
   "description": "롱폼 자동화 시스템 v2 — 실제 TTS 파일 생성 + 영상 렌더",
   "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node server.js"
   },
