@@ -1412,7 +1412,7 @@ ${FORBIDDEN_EN}`;
         try {
           const raw2 = await geminiText({
             apiKey: geminiKey,
-            prompt: buildPrompt(makeBatchTemplate(batch)),
+            prompt: buildPrompt(makeBatchTemplate(batch), prevScenePrompt, firstScenePrompt),
             maxTokens: 8192,
             temp: 0.5,
             model: 'gemini-2.5-flash'
@@ -2052,10 +2052,13 @@ app.post('/api/media/generate-image', async (req, res) => {
   let autoEthnicity = characterEthnicity && characterEthnicity.trim() ? characterEthnicity.trim() : '';
   let culturalContext = '';
   let sceneAspectRatio = '16:9';
+  // body.characterDesc 없으면 meta.json에서 자동 로드 (continuity 보장)
+  let resolvedCharDesc = characterDesc?.trim() || '';
   try {
     const metaPath = pDir(projectId, 'meta.json');
     if (fs.existsSync(metaPath)) {
       const m = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      if (!resolvedCharDesc && m.characterDesc) resolvedCharDesc = m.characterDesc;
       const lang = m.scriptLang || 'ko';
       if (lang === 'ko') {
         if (!autoEthnicity) autoEthnicity = 'all characters must be East Asian Korean appearance with Asian facial features';
@@ -2065,8 +2068,8 @@ app.post('/api/media/generate-image', async (req, res) => {
     }
   } catch (_) {}
 
-  // 인종 + 캐릭터 조합
-  const charFull = [autoEthnicity, characterDesc?.trim()].filter(Boolean).join('. ');
+  // 인종 + 캐릭터 조합 (body 미전달 시 meta fallback 사용)
+  const charFull = [autoEthnicity, resolvedCharDesc].filter(Boolean).join('. ');
   const charPrefix = charFull ? `Character requirements: ${charFull}. ` : '';
   const culturePrefix = culturalContext ? `${culturalContext} ` : '';
 
@@ -2961,7 +2964,7 @@ Return ONLY a JSON array, no markdown:
     meta.scenes = scenes.map(sc => {
       const g = grokMap[sc.sceneNumber];
       if (!g) return sc;
-      const grokEn = postProcessVideoPrompt(g.en || '', imageStyle, charDesc, 550);
+      const grokEn = ensureCharInPrompt(g.en || '', imageStyle, charDesc, 550);
       return { ...sc, grokEn, grokKo: g.ko || '' };
     });
 
@@ -3170,6 +3173,18 @@ function postProcessVideoPrompt(prompt, imageStyle, charDesc, maxLen) {
   return p;
 }
 
+// 영상 프롬프트에 charDesc가 없으면 맨 앞에 강제 삽입 (continuity 보장)
+function ensureCharInPrompt(rawPrompt, imageStyle, charDesc, maxLen) {
+  let p = postProcessVideoPrompt(rawPrompt, imageStyle, charDesc, maxLen);
+  if (!charDesc || !charDesc.trim()) return p;
+  const probe = charDesc.slice(0, 20).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (new RegExp(probe, 'i').test(p)) return p;
+  const prefix = `Main character appearance: ${charDesc}, `;
+  const combined = (prefix + p).replace(/\s{2,}/g, ' ').trim();
+  if (!maxLen || combined.length <= maxLen) return combined;
+  return combined.slice(0, maxLen).replace(/,\s*$/, '').trim();
+}
+
 const FLOW_VIDEO_STYLES = {
   cinematic:   'cinematic live-action film, shallow depth of field, dramatic lighting, film grain, widescreen',
   drama:       'emotional drama, warm soft lighting, intimate close-ups, heartfelt atmosphere, gentle color grade',
@@ -3269,7 +3284,7 @@ ko: Korean version (same visual meaning, max 200 chars)`;
     meta.scenes = scenes.map(sc => {
       const f = flowMap[sc.sceneNumber];
       if (!f) return sc;
-      const flowVideoEn = postProcessVideoPrompt(f.en || '', imageStyle, charDesc, 650);
+      const flowVideoEn = ensureCharInPrompt(f.en || '', imageStyle, charDesc, 650);
       return { ...sc, flowVideoEn, flowVideoKo: f.ko || '' };
     });
     fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
@@ -3359,7 +3374,7 @@ ko: Korean version (same meaning, max 200 chars)`;
     meta.scenes = scenes.map(sc => {
       const f = flowMap[sc.sceneNumber];
       if (!f) return sc;
-      const flowAssetVideoEn = postProcessVideoPrompt(f.en || '', imageStyle, charDesc, 650);
+      const flowAssetVideoEn = ensureCharInPrompt(f.en || '', imageStyle, charDesc, 650);
       return { ...sc, flowAssetVideoEn, flowAssetVideoKo: f.ko || '' };
     });
     fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
