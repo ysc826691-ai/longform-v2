@@ -4278,6 +4278,135 @@ app.post('/api/render/final', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 내부 SSE 엔드포인트 소비 헬퍼
+// ─────────────────────────────────────────────────────────────────────────────
+async function pipeSSE(url, body, onEvent) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`내부 요청 실패 (${response.status}): ${text.slice(0, 200)}`);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        try { onEvent(JSON.parse(line.slice(6))); } catch (_) {}
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 전체 파이프라인 자동 실행
+// POST /api/pipeline/auto
+// body: { projectId, geminiKey, sceneCount?, imageStyle?, characterDesc?,
+//         voiceName?, speed?, videoRenderMode? }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/api/pipeline/auto', async (req, res) => {
+  const {
+    projectId,
+    sceneCount      = 15,
+    imageStyle      = 'Cinematic realistic photography',
+    characterDesc   = '',
+    voiceName       = 'Aoede',
+    speed           = 'normal',
+    videoRenderMode = 'loop',
+  } = req.body;
+  const geminiKey = resolveKey(req.body.geminiKey);
+
+  sseHeaders(res);
+  const send = (data) => { try { sseSend(res, data); } catch (_) {} };
+  const keepalive = setInterval(() => { try { res.write(': ping\n\n'); } catch (_) {} }, 20_000);
+  const finish = (data = {}) => { clearInterval(keepalive); send(data); res.end(); };
+
+  if (!geminiKey) return finish({ type: 'error', error: 'Gemini API Key 필요' });
+  if (!projectId) return finish({ type: 'error', error: 'projectId 필요' });
+
+  const scriptPath = pDir(projectId, 'script.txt');
+  if (!fs.existsSync(scriptPath)) return finish({ type: 'error', error: '대본이 없습니다. 먼저 대본을 생성하세요.' });
+
+  const base = `http://localhost:${PORT}`;
+
+  try {
+    // ── 1. 장면 생성 ─────────────────────────────────────────────────────────
+    send({ type: 'step', step: 'scenes', msg: '장면 생성 중…' });
+    const sceneRes  = await fetch(`${base}/api/scenes/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectId, sceneCount, imageStyle, characterDesc, geminiKey }),
+    });
+    const sceneData = await sceneRes.json();
+    if (sceneData.error) throw new Error('장면 생성 실패: ' + sceneData.error);
+    const scenes = sceneData.scenes || [];
+    send({ type: 'step_done', step: 'scenes', count: scenes.length });
+
+    // ── 2. 이미지 생성 ────────────────────────────────────────────────────────
+    send({ type: 'step', step: 'images', total: scenes.length, msg: `이미지 ${scenes.length}개 생성 중…` });
+    let imgOk = 0, imgFail = 0;
+    for (let i = 0; i < scenes.length; i++) {
+      const sc = scenes[i];
+      send({ type: 'image_progress', current: i + 1, total: scenes.length });
+      try {
+        const imgRes  = await fetch(`${base}/api/media/generate-image`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            projectId,
+            sceneIndex: sc.sceneNumber,
+            prompt:     sc.prompt,
+            relatedLine: sc.relatedLine,
+            imageStyle,
+            characterDesc,
+            geminiKey,
+          }),
+        });
+        const imgData = await imgRes.json();
+        imgData.error ? imgFail++ : imgOk++;
+      } catch (_) { imgFail++; }
+      if (i < scenes.length - 1) await new Promise(ok => setTimeout(ok, 600));
+    }
+    send({ type: 'step_done', step: 'images', ok: imgOk, fail: imgFail });
+
+    // ── 3. TTS 생성 ───────────────────────────────────────────────────────────
+    send({ type: 'step', step: 'tts', msg: 'TTS 생성 중…' });
+    await pipeSSE(
+      `${base}/api/tts/generate`,
+      { projectId, voiceName, speed, geminiKey },
+      (ev) => send({ ...ev, _pipeStep: 'tts' }),
+    );
+    send({ type: 'step_done', step: 'tts' });
+
+    // ── 4. 최종 렌더 ─────────────────────────────────────────────────────────
+    send({ type: 'step', step: 'render', msg: '최종 렌더 중…' });
+    let finalUrl = '';
+    await pipeSSE(
+      `${base}/api/render/final`,
+      { projectId, videoRenderMode },
+      (ev) => {
+        send({ ...ev, _pipeStep: 'render' });
+        if (ev.type === 'done') finalUrl = ev.url || '';
+      },
+    );
+    send({ type: 'step_done', step: 'render' });
+
+    finish({ type: 'done', msg: '파이프라인 완료', url: finalUrl });
+  } catch (err) {
+    finish({ type: 'error', error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 인물 이미지 분석 → 한국어 + 영어 외모 설명 추출
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/character/extract', async (req, res) => {

@@ -641,6 +641,35 @@ video{width:100%;border-radius:9px;background:#000;max-height:480px;
   </div>
 </div>
 
+<!-- ─── 자동 파이프라인 ─────────────────────────────────────────────────── -->
+<div class="card" id="sPipeline" style="display:none;border:1.5px solid rgba(253,39,252,.45);background:linear-gradient(135deg,rgba(21,15,36,.9),rgba(42,10,60,.7))">
+  <div class="card-title" style="color:var(--magenta)">⚡ 전체 자동 파이프라인</div>
+  <div style="margin-bottom:14px;font-size:13px;color:var(--dim)">
+    장면 생성 → 이미지 생성 → TTS → 최종 렌더까지 순서대로 자동 실행합니다.<br>
+    <span style="color:var(--yellow)">※ 단계별 수동 조정이 필요하면 아래 개별 단계를 직접 사용하세요.</span>
+  </div>
+  <div id="stPipeline" class="status"></div>
+
+  <div id="pipelineSteps" style="display:none;margin:12px 0;padding:12px 16px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;font-size:13px;gap:6px">
+    <div id="pstep-scenes" style="color:var(--dim)">⬜ 장면 생성</div>
+    <div id="pstep-images" style="color:var(--dim)">⬜ 이미지 생성</div>
+    <div id="pstep-tts"    style="color:var(--dim)">⬜ TTS 음성</div>
+    <div id="pstep-render" style="color:var(--dim)">⬜ 최종 렌더</div>
+  </div>
+
+  <div class="row-btns">
+    <button class="btn btn-main" id="btnPipelineRun" onclick="runAutoPipeline()" style="background:linear-gradient(135deg,var(--magenta),#6b0a8a);border-color:var(--magenta);font-size:15px;font-weight:800">
+      ⚡ 자동 파이프라인 실행
+    </button>
+    <button class="btn btn-danger btn-sm" id="btnPipelineStop" onclick="stopPipeline()" style="display:none">⏹ 중단</button>
+  </div>
+
+  <div id="pipelineFinalResult" style="display:none;margin-top:16px">
+    <video id="pipelineFinalVideo" controls style="width:100%;border-radius:8px;margin-bottom:8px"></video>
+    <a id="btnDlPipelineFinal" class="btn btn-blue" href="#" download="final.mp4" style="display:block;text-align:center">MP4 다운로드</a>
+  </div>
+</div>
+
 <!-- ─── STEP 03: 장면 생성 ───────────────────────────────────────────────── -->
 <div class="card" id="s03" style="display:none">
   <div class="card-title"><span class="step-num">3</span>장면 생성 + 이미지</div>
@@ -2933,6 +2962,7 @@ async function loadProject(id) {
     if (d.script) {
       scriptData = d.meta;
       renderScriptResult({ ...d.meta, script: d.script });
+      document.getElementById('sPipeline').style.display = 'block';
       document.getElementById('s03').style.display = 'block';
       document.getElementById('exportUploadCard').style.display = 'block';
       document.getElementById('s04').style.display = 'block';
@@ -3166,6 +3196,7 @@ async function confirmScript() {
 
     showSt2('st02','ok','대본 확정 완료 — 장면 생성과 TTS를 진행하세요.');
     setTopStatus('done', '대본 완성');
+    document.getElementById('sPipeline').style.display = 'block';
     document.getElementById('s03').style.display = 'block';
     document.getElementById('exportUploadCard').style.display = 'block';
     document.getElementById('s04').style.display = 'block';
@@ -5982,6 +6013,158 @@ function showSlide(idx) {
 function slideNav(delta) {
   const idx = parseInt(document.getElementById('slidePreviewModal').dataset.idx || '0');
   showSlide(idx + delta);
+}
+
+// ─── 자동 파이프라인 ──────────────────────────────────────────────────────────
+let _pipelineAbortCtrl = null;
+
+function _pipeSetStep(step, status) {
+  const el = document.getElementById('pstep-' + step);
+  if (!el) return;
+  const label = { scenes: '장면 생성', images: '이미지 생성', tts: 'TTS 음성', render: '최종 렌더' }[step] || step;
+  const icon  = { wait: '⬜', running: '🔄', ok: '✅', err: '❌' }[status] || '⬜';
+  const color = { wait: 'var(--dim)', running: 'var(--yellow)', ok: 'var(--green)', err: 'var(--orange)' }[status];
+  el.style.color   = color;
+  el.dataset.label = label;
+  if (!el.dataset.custom) el.textContent = `${icon} ${label}`;
+}
+function _pipeSetStepText(step, text) {
+  const el = document.getElementById('pstep-' + step);
+  if (!el) return;
+  el.dataset.custom = '1';
+  el.textContent = text;
+}
+
+function handlePipelineEvent(ev) {
+  if (ev._pipeStep) {
+    // 포워딩된 TTS / 렌더 이벤트
+    if (ev._pipeStep === 'tts' && ev.type === 'progress') {
+      _pipeSetStepText('tts', `🔄 TTS ${ev.index}/${ev.total}`);
+    } else if (ev._pipeStep === 'render' && ev.type === 'progress') {
+      _pipeSetStepText('render', `🔄 렌더 ${ev.pct}%`);
+      showSt2('stPipeline', 'info', ev.msg || `렌더 ${ev.pct}%`);
+    } else if (ev._pipeStep === 'render' && ev.type === 'done' && ev.url) {
+      _showPipelineFinalVideo(ev.url);
+    } else if (ev._pipeStep === 'render' && ev.type === 'error') {
+      _pipeSetStep('render', 'err');
+      showSt2('stPipeline', 'err', ev.error || '렌더 오류');
+    }
+    return;
+  }
+
+  switch (ev.type) {
+    case 'step': {
+      const el = document.getElementById('pstep-' + ev.step);
+      if (el) { delete el.dataset.custom; }
+      _pipeSetStep(ev.step, 'running');
+      showSt2('stPipeline', 'info', ev.msg || `${ev.step} 처리 중…`);
+      break;
+    }
+    case 'step_done':
+      _pipeSetStep(ev.step, 'ok');
+      if (ev.step === 'images') {
+        showSt2('stPipeline', 'info', `이미지 완료 — 성공: ${ev.ok ?? '?'}개, 실패: ${ev.fail ?? 0}개`);
+        const iel = document.getElementById('pstep-images');
+        if (iel) { delete iel.dataset.custom; }
+        _pipeSetStep('images', 'ok');
+      }
+      break;
+    case 'image_progress':
+      _pipeSetStepText('images', `🔄 이미지 생성 ${ev.current}/${ev.total}`);
+      break;
+    case 'done':
+      showSt2('stPipeline', 'ok', ev.msg || '파이프라인 완료!');
+      if (ev.url) _showPipelineFinalVideo(ev.url);
+      break;
+    case 'error':
+      ['scenes','images','tts','render'].forEach(s => {
+        const e = document.getElementById('pstep-' + s);
+        if (e?.textContent?.includes('🔄')) _pipeSetStep(s, 'err');
+      });
+      showSt2('stPipeline', 'err', ev.error || '오류 발생');
+      break;
+  }
+}
+
+function _showPipelineFinalVideo(url) {
+  const bust = url + '?t=' + Date.now();
+  const wrap = document.getElementById('pipelineFinalResult');
+  const vid  = document.getElementById('pipelineFinalVideo');
+  const dl   = document.getElementById('btnDlPipelineFinal');
+  vid.src = bust;
+  dl.href = url;
+  wrap.style.display = 'block';
+  // 렌더 섹션도 동기화
+  const mainVid = document.getElementById('finalVideo');
+  const mainDl  = document.getElementById('btnDlFinal');
+  if (mainVid) mainVid.src = bust;
+  if (mainDl)  mainDl.href = url;
+  const fr = document.getElementById('finalResult');
+  if (fr) fr.style.display = 'block';
+}
+
+async function runAutoPipeline() {
+  const geminiKey = document.getElementById('geminiKey').value.trim();
+  if (!projectId) { showSt2('stPipeline','err','프로젝트가 없습니다.'); return; }
+  if (!geminiKey) { showSt2('stPipeline','err','Gemini API Key를 입력하세요.'); return; }
+
+  const sceneCount  = parseInt(document.getElementById('sceneCount')?.value) || 15;
+  const imageStyle  = document.getElementById('imageStyle')?.value  || 'Cinematic realistic photography';
+  const voiceName   = document.getElementById('voiceName')?.value   || 'Aoede';
+  const speed       = document.getElementById('voiceSpeed')?.value  || 'normal';
+
+  const runBtn  = document.getElementById('btnPipelineRun');
+  const stopBtn = document.getElementById('btnPipelineStop');
+  runBtn.disabled = true;
+  stopBtn.style.display = '';
+
+  document.getElementById('pipelineSteps').style.display  = 'grid';
+  document.getElementById('pipelineFinalResult').style.display = 'none';
+  ['scenes','images','tts','render'].forEach(s => {
+    _pipeSetStep(s, 'wait');
+    const e = document.getElementById('pstep-' + s);
+    if (e) delete e.dataset.custom;
+  });
+  showSt2('stPipeline','info','파이프라인 시작…');
+
+  _pipelineAbortCtrl = new AbortController();
+
+  try {
+    const resp = await fetch('/api/pipeline/auto', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectId, geminiKey, sceneCount, imageStyle, voiceName, speed }),
+      signal: _pipelineAbortCtrl.signal,
+    });
+    if (!resp.ok) throw new Error(`서버 오류 ${resp.status}`);
+
+    const reader  = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try { handlePipelineEvent(JSON.parse(line.slice(6))); } catch (_) {}
+      }
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') showSt2('stPipeline','err', err.message);
+    else showSt2('stPipeline','warn','중단됨');
+  } finally {
+    runBtn.disabled = false;
+    stopBtn.style.display = 'none';
+    _pipelineAbortCtrl = null;
+  }
+}
+
+function stopPipeline() {
+  if (_pipelineAbortCtrl) { _pipelineAbortCtrl.abort(); }
 }
 </script>
 
